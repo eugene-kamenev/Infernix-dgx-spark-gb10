@@ -38,7 +38,7 @@ ResolvedSamplingParameters resolve_sampling(const ModelSamplingDefaults& default
                                             SamplingMode mode, const SamplingOverrides& overrides,
                                             bool constrained_output) {
     SamplingPreset preset = defaults.for_mode(mode);
-    if (constrained_output) {
+    if (constrained_output || overrides.temperature.value_or(preset.temperature) <= 0.0F) {
         preset.presence_penalty  = 0.0F;
         preset.frequency_penalty = 0.0F;
     }

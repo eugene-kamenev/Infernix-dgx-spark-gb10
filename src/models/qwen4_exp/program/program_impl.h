@@ -2890,8 +2890,8 @@ public:
                     const double dense_equiv   = dense_equiv_experts();
                     const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
                     const bool fixed_override =
-                        batch == 2 ? (replay_clock_ || kHasPairWidthCostOverride)
-                                   : (replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts);
+                        batch == 2 ? (frozen_round_cost() || kHasPairWidthCostOverride)
+                                   : (frozen_round_cost() || kHasMultiRowWidthCostOverride || options_.device_experts);
                     const double slope     = batch == 2 ? kPairWidthCost : kMultiRowWidthCost;
                     const double tile_cost = std::min(slope, 0.10);
                     const auto cost_fn     = [&](std::int32_t w) noexcept {
@@ -6623,6 +6623,10 @@ private:
         return k;
     }
 
+    [[nodiscard]] bool frozen_round_cost() const noexcept {
+        return replay_clock_ || options_.gumbel_sampling;
+    }
+
     // choose_draft_length's choice as the lane's policy round `round` (1-based), without counting it.
     std::int32_t draft_length_at(const Lane& lane, std::uint64_t round) const {
         const std::int32_t most = neural_k();
@@ -6631,7 +6635,7 @@ private:
         std::int32_t best = 0;
         double best_score = 1.0;
         double reach = 1.0, tokens = 1.0;
-        const bool fixed_override = replay_clock_ || kHasWidthCostOverride;
+        const bool fixed_override = frozen_round_cost() || kHasWidthCostOverride;
         const double fixed_cost   = fixed_width_cost();
         const double tile_cost    = std::min(fixed_cost, 0.10);
         // For B=1 gated chains, keep a soft upper ceiling so per-token device cumulative gating
@@ -6668,7 +6672,7 @@ private:
 
     [[nodiscard]] std::pair<double, double> learned_round_costs() const noexcept {
         double dense = prior_dense_equiv(), step = prior_mtp_step_cost();
-        if (replay_clock_) { return {dense, step}; }
+        if (frozen_round_cost()) { return {dense, step}; }
         (void)round_cost_model_.fit(dim(c_.moe.experts), dim(c_.moe.top_k), dense, step, dense, step);
         return {dense, step};
     }
@@ -6682,7 +6686,7 @@ private:
     // At a decode round's start: record the previous B = 1 round across plain, MTP, gated MTP, and
     // n-gram rounds so the coupon-collector cost fit sees both verification width and draft steps.
     void observe_round(Clock::time_point start, std::int32_t batch) {
-        if (last_round_verify_k_ >= 0 && batch == 1) {
+        if (!frozen_round_cost() && last_round_verify_k_ >= 0 && batch == 1) {
             const double seconds = std::chrono::duration<double>(start - last_round_start_).count();
             round_cost_model_.observe(last_round_verify_k_, last_round_draft_exec_, seconds,
                                       dim(c_.moe.experts), dim(c_.moe.top_k),
@@ -6710,7 +6714,7 @@ private:
         std::int32_t best = 0;
         double best_score = 2.0;
         double reach_a = 1.0, reach_b = 1.0, tokens = 2.0;
-        const bool fixed_override = replay_clock_ || kHasPairWidthCostOverride;
+        const bool fixed_override = frozen_round_cost() || kHasPairWidthCostOverride;
         const double tile_cost    = std::min(kPairWidthCost, 0.10);
         const auto [dense_equiv, step_cost] = learned_round_costs();
         const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
@@ -6744,7 +6748,7 @@ private:
         std::int32_t best         = 0;
         double best_score         = static_cast<double>(batch);
         double tokens             = static_cast<double>(batch);
-        const bool fixed_override = replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts;
+        const bool fixed_override = frozen_round_cost() || kHasMultiRowWidthCostOverride || options_.device_experts;
         const double tile_cost    = std::min(kMultiRowWidthCost, 0.10);
         const auto [dense_equiv, step_cost] = learned_round_costs();
         const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
@@ -6773,7 +6777,7 @@ private:
 
     [[nodiscard]] std::int32_t best_copy_len_for(std::int32_t copies, double copy_accept,
                                                  std::int32_t batch) const noexcept {
-        if (replay_clock_ || kHasNgramWidthCostOverride) {
+        if (frozen_round_cost() || kHasNgramWidthCostOverride) {
             return best_copy_length(copies, copy_accept, kNgramWidthCost, kMinCopyAcceptance);
         }
         return best_copy_length_moe(copies, copy_accept, batch, dim(c_.moe.experts), dim(c_.moe.top_k),
@@ -6786,7 +6790,7 @@ private:
         const bool batch_override = !is_dflash2 && ((batch == 1 && kHasWidthCostOverride) ||
                                                     (batch == 2 && kHasPairWidthCostOverride) ||
                                                     (batch >= 3 && (kHasMultiRowWidthCostOverride || options_.device_experts)));
-        if (replay_clock_ || kHasNgramWidthCostOverride || batch_override) {
+        if (frozen_round_cost() || kHasNgramWidthCostOverride || batch_override) {
             const double chain_cost =
                 is_dflash2 ? kWidthCost
                            : (step_sunk ? fixed_width_cost()
@@ -8301,8 +8305,8 @@ private:
         const double dense_equiv   = dense_equiv_experts();
         const std::int32_t experts = dim(c_.moe.experts), top_k = dim(c_.moe.top_k);
         const bool fixed_override =
-            batch == 2 ? (replay_clock_ || kHasPairWidthCostOverride)
-                       : (replay_clock_ || kHasMultiRowWidthCostOverride || options_.device_experts);
+            batch == 2 ? (frozen_round_cost() || kHasPairWidthCostOverride)
+                       : (frozen_round_cost() || kHasMultiRowWidthCostOverride || options_.device_experts);
         const double slope     = batch >= 3 ? kMultiRowWidthCost : kDFlashPairDraftCost;
         const double tile_cost = std::min(slope, 0.10);
         const auto cost_fn     = [&](std::int32_t w) noexcept {

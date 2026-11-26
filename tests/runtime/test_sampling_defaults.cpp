@@ -89,6 +89,49 @@ int main() {
                               .presence_penalty == 1.25F,
                       "a content constraint dropped an explicit presence penalty");
 
+    // Greedy decoding (effective temperature <= 0) also clears preset penalties so defaults such
+    // as NonThinking's presence_penalty = 1.5 do not distort argmax selection, while explicit
+    // caller penalties still apply and positive temperatures continue to inherit preset defaults.
+    {
+        infernix::ModelSamplingDefaults penalized_presets = moe;
+        penalized_presets.non_thinking.frequency_penalty = 0.5F;
+
+        infernix::SamplingOverrides greedy_override;
+        greedy_override.temperature = 0.0F;
+        const infernix::ResolvedSamplingParameters greedy = infernix::runtime::resolve_sampling(
+            penalized_presets, infernix::SamplingMode::NonThinking, greedy_override, false);
+        failures += check(greedy.temperature == 0.0F && greedy.top_k == 20 && greedy.top_p == 0.8F &&
+                              greedy.presence_penalty == 0.0F && greedy.frequency_penalty == 0.0F,
+                          "greedy override kept preset penalties");
+
+        infernix::ModelSamplingDefaults zero_temp_preset = penalized_presets;
+        zero_temp_preset.non_thinking.temperature        = 0.0F;
+        const infernix::ResolvedSamplingParameters zero_preset = infernix::runtime::resolve_sampling(
+            zero_temp_preset, infernix::SamplingMode::NonThinking, infernix::SamplingOverrides{}, false);
+        failures += check(zero_preset.temperature == 0.0F && zero_preset.presence_penalty == 0.0F &&
+                              zero_preset.frequency_penalty == 0.0F,
+                          "greedy preset temperature kept preset penalties");
+
+        infernix::SamplingOverrides greedy_penalized;
+        greedy_penalized.temperature       = 0.0F;
+        greedy_penalized.presence_penalty  = 1.25F;
+        greedy_penalized.frequency_penalty = 0.25F;
+        const infernix::ResolvedSamplingParameters explicit_greedy = infernix::runtime::resolve_sampling(
+            penalized_presets, infernix::SamplingMode::NonThinking, greedy_penalized, false);
+        failures += check(explicit_greedy.temperature == 0.0F &&
+                              explicit_greedy.presence_penalty == 1.25F &&
+                              explicit_greedy.frequency_penalty == 0.25F,
+                          "greedy override dropped explicit caller penalties");
+
+        infernix::SamplingOverrides positive_temp;
+        positive_temp.temperature = 0.7F;
+        const infernix::ResolvedSamplingParameters positive = infernix::runtime::resolve_sampling(
+            penalized_presets, infernix::SamplingMode::NonThinking, positive_temp, false);
+        failures += check(positive.temperature == 0.7F && positive.presence_penalty == 1.5F &&
+                              positive.frequency_penalty == 0.5F,
+                          "positive temperature failed to inherit preset penalties");
+    }
+
     infernix::SamplingOverrides overrides;
     overrides.temperature       = 0.0F;
     overrides.top_k             = 0;
