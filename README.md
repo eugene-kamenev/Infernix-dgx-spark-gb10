@@ -9,7 +9,7 @@
 ## Key Architectural Highlights on NVIDIA DGX Spark (`GB10`)
 
 ### 1. Full-Model Unified Memory Residency for `Qwen3.8-Flash-Next` (`FastQ` / `FastQ-RHT16`)
-On **DGX Spark's 128 GB unified LPDDR5X**, Infernix pins all 48 layers of routed experts directly in device-accessible unified memory (`INFERNIX_EXPERTS_ON_GPU=1`, zero PCIe miss transfers) and streams the PLE n-gram volume with a 16 GiB GPU-direct UMA cache and 20-thread ARMv9.2 prefill workers.
+On **DGX Spark's 128 GB unified LPDDR5X**, Infernix pins all 48 layers of routed experts directly in device-accessible unified memory (`INFERNIX_EXPERTS_ON_GPU=1`, zero PCIe miss transfers) and streams the **PLE (Per-Layer Embedding) n-gram weight table** volume with a 16 GiB GPU-direct UMA cache and 20-thread ARMv9.2 prefill workers.
 
 ### 2. Microarchitectural Retuning for Blackwell `sm_121a` (48 SMs, 24 MiB L2)
 - **Native 2-Term Row-Scaled `NVFP4 A4` TMA (`OMMA.16864.F32.E2M1`, `501.6 TFLOP/s` pipe)**: Trunk and MoE projections dynamically quantize BF16 activations into two per-token row-scaled NVFP4 terms (`FastPath::Nvfp4A4Pair`) using 1-pass register-cached reciprocals and 2-CTA/SM `128×64` TMA tiles with `CU_TENSOR_MAP_L2_PROMOTION_L2_128B`.
@@ -28,7 +28,7 @@ On **DGX Spark's 128 GB unified LPDDR5X**, Infernix pins all 48 layers of routed
 
 | Model | Hugging Face Download | Description |
 |---|---|---|
-| **`Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ`** | [eugene-kamenev/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ](https://huggingface.co/eugene-kamenev/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ) | `Qwen3.8-Flash-Next` (`Qwen4ExpForCausalLM`) in `FastQ-RHT16` layout (`69.999 GiB` payload: `q8_g32_fp16` HC & output head, `nvfp4_rht16_mse` boundary GDN input projections, `fp8_e4m3fn_g32_e8m0` attention layers, `nvfp4` trunk/shared/mid-GDN) with `--vision`, `--expert-a4-activations`, MTP + PLE n-gram speculation. |
+| **`Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ`** | [eugene-kamenev/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ](https://huggingface.co/eugene-kamenev/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ) | `Qwen3.8-Flash-Next` (`Qwen4ExpForCausalLM`) in `FastQ-RHT16` layout (`69.999 GiB` payload: `q8_g32_fp16` HC & output head, `nvfp4_rht16_mse` boundary GDN input projections, `fp8_e4m3fn_g32_e8m0` attention layers, `nvfp4` trunk/shared/mid-GDN) with `--vision`, `--expert-a4-activations`, external PLE n-gram embedding volume, and mixed MTP + n-gram copy speculation. |
 
 ---
 
@@ -71,12 +71,12 @@ INFERNIX_EXPERTS_ON_GPU=1 \
   --expert-a4-activations \
   --vision \
   --spec mtp --draft-tokens auto \
-  --ngram-volume /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-v5/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram \
+  --ngram-draft-tokens 31 \
+  --ngram-min-match 8 \
+  --ngram-volume /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix.ngram \
   --ngram-residency volume \
   --ngram-cache-mib 16384 \
   --kv-dtype int8 \
-  --ngram-draft-tokens 31 \
-  --ngram-min-match 8 \
   --temperature 1.0 \
   --top-p 0.9 \
   --min-p 0.1 \
@@ -111,9 +111,13 @@ For example, a burst of 16 simultaneous requests (`C16`) against `--max-concurre
 
 Once a request is admitted to an active lane, `--pending-timeout-ms` no longer applies. See [HTTP Serving — Execution behavior](docs/serving.md#execution-behavior) for full queueing and scheduling details.
 
-#### Tuning the N-gram Row Cache (`--ngram-cache-mib`)
+#### Tuning the PLE N-gram Embedding Cache (`--ngram-cache-mib`)
 
-When streaming the PLE n-gram table from NVMe (`--ngram-residency volume`), `--ngram-cache-mib` sets the budget for the 4-way set-associative host/UMA row cache (rounded down to the largest power-of-two slot count from `2^16` to `2^28` rows that fits in the budget; `0` uses the default `2^20` rows).
+> **Note:** `infernix-serve` uses `--ngram-*` flags for two unrelated features:
+> - **PLE (Per-Layer Embedding) weight table** (`--ngram-volume`, `--ngram-residency`, `--ngram-cache-mib`): External Per-Layer Embedding weights read during forward execution in `Qwen3.8-Flash-Next`.
+> - **N-gram copy speculation** (`--ngram-draft-tokens`, `--ngram-min-match`): Token-sequence matching from the prompt/generation history that proposes draft continuations alongside `--spec mtp`.
+
+When streaming the PLE n-gram weight table from NVMe (`--ngram-residency volume`), `--ngram-cache-mib` sets the budget for the 4-way set-associative host/UMA row cache (rounded down to the largest power-of-two slot count from `2^16` to `2^28` rows that fits in the budget; `0` uses the default `2^20` rows).
 
 The example command above uses `--ngram-cache-mib 16384` (configurable via `NGRAM_CACHE_MIB=8192 ./tools/run_server.sh fastq`), whereas a tighter budget such as `--ngram-cache-mib 2048` reduces unified memory footprint shared with `--kv-capacity` and `--host-context-mib` at the cost of more NVMe read misses. Tune it in power-of-two steps (`2048`–`16384`) for your workload, and run with `--log-level debug` to inspect per-request `n-gram rows` cache hit rates and NVMe read time (see [Qwen3.8-Flash-Next Guide — N-gram table in RAM](docs/qwen3_8-flash-next.md#n-gram-table-in-ram)).
 
