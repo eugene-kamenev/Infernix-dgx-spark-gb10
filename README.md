@@ -139,21 +139,33 @@ The example command above uses `--ngram-cache-mib 16384` (configurable via `NGRA
 
 ### `llama-benchy` Results (`FastQ-RHT16`, `int8` KV Cache)
 
-Measured via `tool-eval-bench bench --perf-only` (`llama-benchy 0.4.0`, synthetic prompts with `0%` prefix-cache reuse). Model loading takes **~8s**; full engine startup and CUDA graph capture takes **~14–16s** (`68.80 GiB` GPU weights).
+Measured via `tool-eval-bench bench --perf-only` (`llama-benchy 0.4.0`, `pp=[2048]`, `tg=[128]`, `depth=[0, 4096, 8192]`, `concurrency=[1, 2, 4]`, `runs=3`, synthetic prompts with `0%` prefix-cache reuse). Model loading takes **~8s**; full engine startup and CUDA graph capture takes **~14–16s** (`68.80 GiB` GPU weights).
 
 | Test | c | pp t/s | tg t/s | TTFT (ms) | Total (ms) |
 |---|---:|---:|---:|---:|---:|
-| pp2048 tg128 @ d0 | c1 | 3,366* | 84.0 | 608 | 2,120 |
-| pp2048 tg128 @ d0 | c2 | 3,076 | 118.3 | 1,197 | 3,334 |
-| pp2048 tg128 @ d0 | c4 | 3,143 | 185.5 | 2,339 | 4,988 |
-| pp2048 tg128 @ d4096 | c1 | 3,806* | 82.5 | 1,614 | 3,153 |
-| pp2048 tg128 @ d4096 | c2 | 3,546 | 112.5 | 3,111 | 5,307 |
-| pp2048 tg128 @ d4096 | c4 | 3,524 | 170.0 | 6,298 | 9,081 |
-| pp2048 tg128 @ d8192 | c1 | 4,036* | 86.4 | 2,537 | 4,007 |
-| pp2048 tg128 @ d8192 | c2 | 3,694 | 106.0 | 5,020 | 7,333 |
-| pp2048 tg128 @ d8192 | c4 | 3,697 | 164.9 | 10,115 | 13,040 |
+| pp2048 tg128 @ d0 | c1 | 3,516* | 88.1 | 583 | 2,025 |
+| pp2048 tg128 @ d0 | c2 | 3,215 | 108.1 | 1,170 | 3,496 |
+| pp2048 tg128 @ d0 | c4 | 3,243 | 182.2 | 2,319 | 5,009 |
+| pp2048 tg128 @ d4096 | c1 | 4,297* | 81.0 | 1,430 | 2,997 |
+| pp2048 tg128 @ d4096 | c2 | 3,853 | 107.2 | 2,873 | 5,218 |
+| pp2048 tg128 @ d4096 | c4 | 3,826 | 173.6 | 5,810 | 8,541 |
+| pp2048 tg128 @ d8192 | c1 | 4,495* | 83.8 | 2,278 | 3,793 |
+| pp2048 tg128 @ d8192 | c2 | 4,027 | 112.3 | 4,582 | 6,820 |
+| pp2048 tg128 @ d8192 | c4 | 4,028 | 182.8 | 9,187 | 11,845 |
 
 \* `c = 1` prefill column is an estimator output, not wall-clock throughput — only `TTFT`-derived rates are meaningful at `c = 1`.
+
+### Greedy Decode Results on Real Workloads (`FastQ-RHT16`, `temperature=0.0`)
+
+Synthetic `llama-benchy` prompts at server default `temperature=1.0` run at `81.0–88.1 tok/s` (`c1`). On structured real prompts at `temperature=0.0` (`FastQ-RHT16`, `int8` KV cache, `c1`, `--spec mtp --draft-tokens auto --lm-head-draft`, `reasoning_effort=medium`, `INFERNIX_PROPOSAL_SCREEN_ROWS=0`, `--ngram-draft-tokens 0`), MTP acceptance rises to `76.9–82.0%`:
+
+| Workload | Prompt / Output Tokens | Decode (tok/s) | MTP Acceptance | TTFT (ms) | Total (Server / Client) |
+|---|---:|---:|---:|---:|---:|
+| Coding (Python TTL LRU cache + unit tests) | 69 / 512 | 108.2 | 391/477 (82.0%) | 127 | 4.9s / 4.87s |
+| Math / Reasoning (`3x3` eigendecomposition proof) | 70 / 512 | 122.5 | 421/540 (78.0%) | 123 | 4.3s / 4.30s |
+| Turn-1 Tool Calling (3 declared tools) | 821 / 75 | 101.6 | 60/78 (76.9%) | 484 | 1.2s / 1.22s |
+
+Against the live `run_server.sh` server configuration with n-gram drafting enabled (`--ngram-draft-tokens 31 --ngram-min-match 8`) on the same 3 greedy prompts immediately after `llama-benchy`, end-to-end client latencies were `5.86s` for Coding (`69` prompt / `512` output), `4.41s` for Math / Reasoning (`70` prompt / `512` output), and `1.24s` for Turn-1 Tool Calling (`821` prompt / `75` output).
 
 ### `262K` NIAH Gate Results (`FastQ-RHT16`, `2048` Needles, `int8` KV Cache)
 
