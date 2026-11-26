@@ -4405,15 +4405,16 @@ private:
             if (tree_round && row_is_tree_[b]) {
                 const auto n            = static_cast<std::int32_t>(drafts_[b].size());
                 const std::int32_t side = n + 1;
+                const std::int32_t sc   = tree_side_count_[b];
                 const std::int32_t p    = positions[b];
                 for (std::int32_t j = f; j < t; ++j) {
                     window_.clear();
-                    if (j == side) {
+                    if (j >= side && j < side + sc) {
                         for (std::int32_t q = p - (context - 1); q <= p; ++q) {
                             window_.push_back(q < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(q)]);
                         }
-                        window_.push_back(tree_side_token_[b]);
-                    } else if (j > side) {
+                        window_.push_back(tree_side_tokens_[b][static_cast<std::size_t>(j - side)]);
+                    } else if (j >= side + sc) {
                         for (std::int32_t q = p - context; q <= p; ++q) {
                             window_.push_back(q < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(q)]);
                         }
@@ -4618,11 +4619,12 @@ private:
             const std::int32_t p     = positions[b];
             const auto n             = static_cast<std::int32_t>(drafts_[b].size());
             const bool row_tree      = tree_round && row_is_tree_[b];
-            const std::int32_t nodes = row_tree ? (n + 2) : W;
+            const std::int32_t sc    = row_tree ? tree_side_count_[b] : 0;
+            const std::int32_t nodes = row_tree ? (n + 1 + sc) : W;
             for (std::int32_t j = 0; j < W; ++j) {
                 std::int32_t* col_dst = dst + static_cast<std::size_t>(b * W + j) * n_ctx;
-                if (row_tree && j == n + 1) {
-                    col_dst[0] = tree_side_token_[b];
+                if (row_tree && j >= n + 1 && j < nodes) {
+                    col_dst[0] = tree_side_tokens_[b][static_cast<std::size_t>(j - (n + 1))];
                     for (std::int32_t s = 1; s < n_ctx; ++s) {
                         const std::int32_t at = p - (s - 1);
                         col_dst[s] = at < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(at)];
@@ -5786,7 +5788,7 @@ private:
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         row_is_tree_.fill(false);
-        tree_side_token_.fill(0);
+        tree_side_count_.fill(0);
         const bool dflash_sampled_preview =
             dflash_round_ && sampled_dflash_drafts_ &&
             std::any_of(lanes.begin(), lanes.end(), [&](std::uint32_t l) { return lanes_[l].sampling.temperature > 0.0F; });
@@ -5802,27 +5804,30 @@ private:
         }
         const std::int32_t model_limit =
             std::min(dim(c_.context_ceiling()), static_cast<std::int32_t>(options_.max_context));
-        if (options_.univer_trees && batch <= 2 && !c_.lossless && sampled_preview && !any_constrained) {
+        if (options_.univer_trees && batch == 1 && !c_.lossless && sampled_preview && !any_constrained) {
             constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
             for (std::int32_t b = 0; b < batch; ++b) {
                 const Lane& lane = lanes_[lanes[b]];
                 const auto n     = static_cast<std::int32_t>(drafts_[b].size());
                 if (stitched_ngram_[b] || !(lane.sampling.temperature > 0.0F) || n < 1 ||
-                    n > ops::kSpeculativeTreeMaxPathLength - 1 ||
-                    n + 2 > std::min(max_width_, ops::kSpeculativeTreeMaxNodes)) {
+                    n > ops::kSpeculativeTreeMaxPathLength - 1) {
                     continue;
                 }
                 const std::int32_t allocated_kv =
                     static_cast<std::int32_t>(lane.prefix.page_base + lane.pages.size()) * kPagedKVPageSize;
                 const std::int32_t lane_limit =
                     std::min({model_limit, static_cast<std::int32_t>(lane.extent), allocated_kv});
-                if (positions[b] + n + 2 > lane_limit) { continue; }
+                const std::int32_t avail_sides =
+                    std::min({kMaxRootForkSides, std::min(max_width_, ops::kSpeculativeTreeMaxNodes) - (n + 1),
+                              lane_limit - (positions[b] + n + 1)});
+                if (avail_sides <= 0) { continue; }
                 if (from_ngram_[b]) {
                     if ((r_ <= 1 || (positions[b] % r_) != (r_ - 2)) &&
                         ngram_alt_token_[b] >= 0 && ngram_alt_token_[b] != drafts_[b][0]) {
-                        row_is_tree_[b]     = true;
-                        tree_side_token_[b] = ngram_alt_token_[b];
-                        width               = std::max(width, n + 2);
+                        row_is_tree_[b]         = true;
+                        tree_side_count_[b]     = 1;
+                        tree_side_tokens_[b][0] = ngram_alt_token_[b];
+                        width                   = std::max(width, n + 2);
                     }
                     continue;
                 }
@@ -5841,13 +5846,14 @@ private:
                     }
                 }
                 if (cands == nullptr || qs == nullptr) { continue; }
-                const auto dec = choose_root_fork_side(
+                const auto dec = choose_root_fork_sides(
                     drafts_[b][0], std::span<const std::int32_t>(cands, C), std::span<const float>(qs, C),
-                    positions[b], r_, lane.sampling.seed);
-                if (dec.fork) {
-                    row_is_tree_[b]     = true;
-                    tree_side_token_[b] = dec.side_token;
-                    width               = std::max(width, n + 2);
+                    positions[b], r_, lane.sampling.seed, avail_sides);
+                if (dec.count > 0) {
+                    row_is_tree_[b]      = true;
+                    tree_side_count_[b]  = dec.count;
+                    tree_side_tokens_[b] = dec.side_tokens;
+                    width                = std::max(width, n + 1 + dec.count);
                 }
             }
         }
@@ -5867,10 +5873,18 @@ private:
         }
         if (W < 3 || W > ops::kSpeculativeTreeMaxNodes) {
             row_is_tree_.fill(false);
+            tree_side_count_.fill(0);
         } else {
             for (std::int32_t b = 0; b < batch; ++b) {
-                if (row_is_tree_[b] && static_cast<std::int32_t>(drafts_[b].size()) + 2 > W) {
-                    row_is_tree_[b] = false;
+                if (row_is_tree_[b] &&
+                    static_cast<std::int32_t>(drafts_[b].size()) + 1 + tree_side_count_[b] > W) {
+                    const std::int32_t fit = W - (static_cast<std::int32_t>(drafts_[b].size()) + 1);
+                    if (fit <= 0) {
+                        row_is_tree_[b]     = false;
+                        tree_side_count_[b] = 0;
+                    } else {
+                        tree_side_count_[b] = fit;
+                    }
                 }
             }
         }
@@ -5896,13 +5910,17 @@ private:
             host_lanes_[b]       = static_cast<std::int32_t>(lanes[b]);
             if (tree_round) {
                 auto* tree_rows_host = reinterpret_cast<ops::SpeculativeTreeRow*>(spec_host(spec_layout_.tree_rows));
-                build_root_fork_tree_row(tree_rows_host[b], n, row_is_tree_[b]);
+                build_root_fork_tree_row(tree_rows_host[b], n, row_is_tree_[b] ? tree_side_count_[b] : 0);
                 const std::int32_t nodes = tree_rows_host[b].nodes;
                 ids[b * W + 0]           = lane.history.back();
                 for (std::int32_t j = 1; j <= n; ++j) {
                     ids[b * W + j] = drafts_[b][static_cast<std::size_t>(j - 1)];
                 }
-                if (row_is_tree_[b]) { ids[b * W + n + 1] = tree_side_token_[b]; }
+                if (row_is_tree_[b]) {
+                    for (std::int32_t k = 0; k < tree_side_count_[b]; ++k) {
+                        ids[b * W + n + 1 + k] = tree_side_tokens_[b][static_cast<std::size_t>(k)];
+                    }
+                }
                 for (std::int32_t j = nodes; j < W; ++j) { ids[b * W + j] = ids[b * W + nodes - 1]; }
                 for (std::int32_t j = 0; j < W; ++j) {
                     pos[b * W + j]       = p + j;
@@ -6085,15 +6103,15 @@ private:
                         const std::size_t tail = static_cast<std::size_t>(n - neural_n);
                         for (std::int32_t j = neural_n; j < n; ++j) {
                             const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
-                            if (j == 0 && row_is_tree_[b] && from_ngram_[b] && tree_side_token_[b] != token) {
+                            if (j == 0 && row_is_tree_[b] && from_ngram_[b] && tree_side_tokens_[b][0] != token) {
                                 const float q0           = ngram_alt_q0_[b];
                                 host_candidates[row + 0] = token;
                                 host_q[row + 0]          = q0;
-                                host_candidates[row + 1] = tree_side_token_[b];
+                                host_candidates[row + 1] = tree_side_tokens_[b][0];
                                 host_q[row + 1]          = 1.0F - q0;
                                 std::int32_t filler      = (token + 1) % token_domain_;
                                 for (std::int32_t c = 2; c < C; ++c) {
-                                    while (filler == token || filler == tree_side_token_[b]) {
+                                    while (filler == token || filler == tree_side_tokens_[b][0]) {
                                         filler = (filler + 1) % token_domain_;
                                     }
                                     host_candidates[row + c] = filler;
@@ -8370,7 +8388,8 @@ private:
     std::vector<std::uint32_t> ngram_slots_scratch_;
     std::vector<PagedKVBatchLayerView> kv_compact_layers_;
     std::array<bool, kMaximumConcurrency> row_is_tree_{};
-    std::array<std::int32_t, kMaximumConcurrency> tree_side_token_{};
+    std::array<std::int32_t, kMaximumConcurrency> tree_side_count_{};
+    std::array<std::array<std::int32_t, kMaxRootForkSides>, kMaximumConcurrency> tree_side_tokens_{};
     std::array<std::int32_t, kMaximumConcurrency> ngram_alt_token_{};
     std::array<float, kMaximumConcurrency> ngram_alt_q0_{};
     std::array<std::int32_t, kMaximumConcurrency> ngram_proposal_alt_token_{};

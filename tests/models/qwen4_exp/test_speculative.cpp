@@ -544,6 +544,47 @@ void check_root_fork_trees() {
     require(floor_verify_width(11, 32) == 10 && floor_verify_width(13, 16) == 12 &&
                 floor_verify_width(17, 16) == 16 && floor_verify_width(9, 16) == 8,
             "floor_verify_width handles exact boundary buckets");
+
+    // Multi-branch root-fork tiering and distinct without-replacement sibling draws.
+    using infernix::models::qwen4_exp::choose_root_fork_sides;
+    using infernix::models::qwen4_exp::kMaxRootForkSides;
+    auto tier_q = q;
+    // max_p >= 0.65 -> 1 side; [0.40, 0.65) -> 2 sides; < 0.40 -> 3 sides.
+    tier_q[0] = 0.70F;
+    for (std::size_t i = 1; i < 16; ++i) { tier_q[i] = 0.02F; }
+    require(choose_root_fork_sides(1000, cands, tier_q, 100, 4, 42).count == 1,
+            "max_p in [0.65, 0.90) opens 1 side branch");
+    require(choose_root_fork_sides(1000, cands, q, 100, 4, 42).count == 2,
+            "max_p in [0.40, 0.65) opens 2 side branches");
+    auto flat_q = q;
+    for (std::size_t i = 0; i < 16; ++i) { flat_q[i] = 0.0625F; }
+    const auto multi = choose_root_fork_sides(1000, cands, flat_q, 100, 4, 42);
+    require(multi.count == kMaxRootForkSides, "max_p < 0.40 opens kMaxRootForkSides=3 branches");
+    for (std::int32_t i = 0; i < multi.count; ++i) {
+        const std::int32_t tok = multi.side_tokens[static_cast<std::size_t>(i)];
+        require(tok != 1000 && tok >= 1001 && tok <= 1015, "multi-fork draws valid candidates");
+        for (std::int32_t j = 0; j < i; ++j) {
+            require(tok != multi.side_tokens[static_cast<std::size_t>(j)],
+                    "multi-fork siblings are pairwise distinct");
+        }
+    }
+
+    SpeculativeTreeRow multi_row{};
+    build_root_fork_tree_row(multi_row, /*main_depth=*/3, /*side_count=*/3);
+    require(multi_row.tree == 1 && multi_row.nodes == 7 && multi_row.paths == 4,
+            "3-side tree sets nodes=7 and paths=4");
+    require(multi_row.first_child[0] == 1 && multi_row.next_sibling[1] == 4 &&
+                multi_row.next_sibling[4] == 5 && multi_row.next_sibling[5] == 6 &&
+                multi_row.next_sibling[6] == -1,
+            "3-side sibling linked list matches draw order");
+    for (std::int32_t k = 0; k < 3; ++k) {
+        const std::int32_t col = 4 + k;
+        require(multi_row.parent[col] == 0 && multi_row.depth[col] == 1 &&
+                    multi_row.sibling_index[col] == 1 + k && multi_row.path_length[1 + k] == 2 &&
+                    multi_row.owned_from[1 + k] == 1 && multi_row.path_columns[1 + k][0] == 0 &&
+                    multi_row.path_columns[1 + k][1] == col,
+                "3-side branch metadata is exact");
+    }
     (void)kSpeculativeTreeMaxNodes;
     (void)kSpeculativeTreeMaxPathLength;
 }

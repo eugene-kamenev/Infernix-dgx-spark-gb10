@@ -504,18 +504,79 @@ struct RootForkDecision {
     return picked >= 0 ? RootForkDecision{.fork = true, .side_token = picked} : RootForkDecision{};
 }
 
-// Builds a depth-1 root-fork SpeculativeTreeRow (transport = 0, without-replacement):
-// path 0 is the main chain `0..main_depth`; when `has_side`, column `main_depth + 1` forks off
-// root column 0 at depth 1 and path 1 is `{0, main_depth + 1}`.
-inline void build_root_fork_tree_row(ops::SpeculativeTreeRow& row, std::int32_t main_depth, bool has_side) noexcept {
+inline constexpr std::int32_t kMaxRootForkSides = 3;
+
+struct RootForkSidesDecision {
+    std::int32_t count = 0;
+    std::array<std::int32_t, kMaxRootForkSides> side_tokens{};
+};
+
+// Selects 0..kMaxRootForkSides distinct alternative step-0 tokens without replacement based on
+// step-0 top-1 confidence tier (`max_p >= 0.90 -> 0`, `[0.65, 0.90) -> 1`, `[0.40, 0.65) -> 2`,
+// `< 0.40 -> 3`), independently of realized `main_token`.
+[[nodiscard]] inline RootForkSidesDecision choose_root_fork_sides(
+    std::int32_t main_token, std::span<const std::int32_t> candidates, std::span<const float> q,
+    std::int32_t position, std::int32_t ratio, std::uint64_t seed,
+    std::int32_t max_sides = kMaxRootForkSides) noexcept {
+    if (ratio > 1 && (position % ratio) == (ratio - 2)) { return {}; }
+    if (candidates.size() < 2 || candidates.size() != q.size() || max_sides <= 0) { return {}; }
+    float max_p = 0.0F;
+    for (const float p : q) {
+        if (std::isfinite(p) && p > max_p) { max_p = p; }
+    }
+    if (max_p >= 0.90F) { return {}; }
+    const std::int32_t tier = max_p >= 0.65F ? 1 : (max_p >= 0.40F ? 2 : 3);
+    const std::int32_t want = std::min({tier, max_sides, kMaxRootForkSides});
+    RootForkSidesDecision out{};
+    for (std::int32_t k = 0; k < want; ++k) {
+        const auto already = [&](std::int32_t tok) noexcept {
+            if (tok == main_token) { return true; }
+            for (std::int32_t j = 0; j < out.count; ++j) {
+                if (out.side_tokens[static_cast<std::size_t>(j)] == tok) { return true; }
+            }
+            return false;
+        };
+        double residual = 0.0;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (!already(candidates[i]) && std::isfinite(q[i]) && q[i] > 0.0F) { residual += q[i]; }
+        }
+        if (residual <= 1e-6) { break; }
+        std::uint64_t x = seed ^ (static_cast<std::uint64_t>(position) * 0x9E3779B97F4A7C15ULL) ^
+                          (static_cast<std::uint64_t>(k) * 0xBF58476D1CE4E5B9ULL);
+        x += 0x9E3779B97F4A7C15ULL;
+        x = (x ^ (x >> 30)) * 0xBF58476D1CE4E5B9ULL;
+        x = (x ^ (x >> 27)) * 0x94D049BB133111EBULL;
+        x ^= (x >> 31);
+        const double u      = static_cast<double>(x >> 11) * (1.0 / static_cast<double>(std::uint64_t{1} << 53));
+        const double target = u * residual;
+        double accum        = 0.0;
+        std::int32_t picked = -1;
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            if (already(candidates[i]) || !std::isfinite(q[i]) || q[i] <= 0.0F) { continue; }
+            picked = candidates[i];
+            accum += q[i];
+            if (accum >= target) { break; }
+        }
+        if (picked < 0) { break; }
+        out.side_tokens[static_cast<std::size_t>(out.count++)] = picked;
+    }
+    return out;
+}
+
+// Builds a depth-1 multi-branch root-fork SpeculativeTreeRow (transport = 0, without-replacement):
+// path 0 is the main chain `0..main_depth`; columns `main_depth + 1 .. main_depth + side_count`
+// fork off root column 0 at depth 1 and paths `1..side_count` are `{0, main_depth + k}`.
+inline void build_root_fork_tree_row(ops::SpeculativeTreeRow& row, std::int32_t main_depth,
+                                     std::int32_t side_count) noexcept {
     std::memset(&row, 0, sizeof(row));
     std::fill(std::begin(row.parent), std::end(row.parent), static_cast<std::int8_t>(-1));
     std::fill(std::begin(row.first_child), std::end(row.first_child), static_cast<std::int8_t>(-1));
     std::fill(std::begin(row.next_sibling), std::end(row.next_sibling), static_cast<std::int8_t>(-1));
-    row.main_depth = main_depth;
-    row.tree       = has_side ? 1 : 0;
-    row.transport  = 0;
-    row.sampled    = 0;
+    const std::int32_t sides = std::clamp<std::int32_t>(side_count, 0, kMaxRootForkSides);
+    row.main_depth           = main_depth;
+    row.tree                 = sides > 0 ? 1 : 0;
+    row.transport            = 0;
+    row.sampled              = 0;
     for (std::int32_t c = 1; c <= main_depth; ++c) {
         row.parent[c]          = static_cast<std::int8_t>(c - 1);
         row.depth[c]           = static_cast<std::int8_t>(c);
@@ -525,22 +586,29 @@ inline void build_root_fork_tree_row(ops::SpeculativeTreeRow& row, std::int32_t 
     }
     row.path_length[0] = static_cast<std::int8_t>(main_depth + 1);
     row.owned_from[0]  = 0;
-    if (has_side) {
-        const std::int32_t s = main_depth + 1;
-        row.nodes            = main_depth + 2;
-        row.paths            = 2;
+    row.nodes          = main_depth + 1 + sides;
+    row.paths          = 1 + sides;
+    std::int32_t prev  = main_depth >= 1 ? 1 : -1;
+    for (std::int32_t k = 0; k < sides; ++k) {
+        const std::int32_t s = main_depth + 1 + k;
         row.parent[s]        = 0;
         row.depth[s]         = 1;
-        row.next_sibling[1]  = static_cast<std::int8_t>(s);
-        row.sibling_index[s] = 1;
-        row.path_length[1]   = 2;
-        row.owned_from[1]    = 1;
-        row.path_columns[1][0] = 0;
-        row.path_columns[1][1] = static_cast<std::int8_t>(s);
-    } else {
-        row.nodes = main_depth + 1;
-        row.paths = 1;
+        if (k == 0 && prev < 0) {
+            row.first_child[0] = static_cast<std::int8_t>(s);
+        } else if (prev >= 0) {
+            row.next_sibling[prev] = static_cast<std::int8_t>(s);
+        }
+        prev                               = s;
+        row.sibling_index[s]               = static_cast<std::int8_t>(1 + k);
+        row.path_length[1 + k]             = 2;
+        row.owned_from[1 + k]              = 1;
+        row.path_columns[1 + k][0]         = 0;
+        row.path_columns[1 + k][1]         = static_cast<std::int8_t>(s);
     }
+}
+
+inline void build_root_fork_tree_row(ops::SpeculativeTreeRow& row, std::int32_t main_depth, bool has_side) noexcept {
+    build_root_fork_tree_row(row, main_depth, has_side ? 1 : 0);
 }
 
 // Calibrates a binned per-step acceptance rate for D-Cut. Greedy chains use the bin table
