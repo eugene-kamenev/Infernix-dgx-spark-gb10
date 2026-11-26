@@ -9,6 +9,7 @@ infernix_add_test(infernix_artifact_materialization_test
 target_link_options(infernix_artifact_materialization_test PRIVATE
   "LINKER:--wrap=cudaMalloc"
   "LINKER:--wrap=cudaMallocHost"
+  "LINKER:--wrap=cudaHostAlloc"
   "LINKER:--wrap=cudaFree"
   "LINKER:--wrap=cudaFreeHost"
   "LINKER:--wrap=cudaEventCreateWithFlags"

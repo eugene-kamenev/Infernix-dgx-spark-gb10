@@ -4939,7 +4939,24 @@ bool moe_route_dispatch_plan(const Tensor& logits, std::int32_t top_k, MoeRoutin
 void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource& source,
                           std::int32_t max_jobs, void* workspace, Tensor& outputs, cudaStream_t stream) {
     if (forked(source, max_jobs, x.ne[1])) { CUDA_CHECK(cudaStreamWaitEvent(stream, source.fork_events[1], 0)); }
-    if (!cpu_served(x, source)) { return; }
+    if (!cpu_served(x, source)) {
+        const bool ggml     = ggml_bank(source);
+        const bool nvfp4_a8 = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
+        if (source.tail_skip_rank > 0 && source.staging_slots == 0 && source.fetch.request == nullptr &&
+            source.omma_narrow && !ggml && !nvfp4_a8 && source.activation == moe::ExpertActivation::kA4 &&
+            source.shape == moe::kFlashNextShape && x.ne[1] >= 2 && x.ne[1] <= moe::kMaxColumns) {
+            const auto layout = moe::wide::carve_experts_workspace(workspace, source.shape, max_jobs, outputs.ne[1], x.ne[1],
+                                                                   source.activation, source.wide_a16);
+            if (layout.entry_map != nullptr && layout.narrow_jobs != nullptr && layout.pass_narrow != nullptr &&
+                layout.x_plane != nullptr) {
+                tail_zero_kernel<<<kWaitCtas, kThreads, 0, stream>>>(
+                    dispatch, static_cast<int>(max_jobs), layout.cpu_flags, source.shape.hidden,
+                    static_cast<bf16*>(outputs.data));
+                check_launch("tail zero");
+            }
+        }
+        return;
+    }
     std::int32_t* cpu_flags = nullptr;
     CpuCall* call    = cpu_call_of(workspace, x, source, max_jobs, outputs.ne[1], &cpu_flags);
     if (source.tail_skip_rank > 0) {

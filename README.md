@@ -69,6 +69,7 @@ INFERNIX_EXPERTS_ON_GPU=1 \
 ./build-native/apps/infernix-serve \
   /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16.infernix \
   --expert-a4-activations \
+  --expert-tail-skip 8 \
   --vision \
   --spec mtp --draft-tokens auto \
   --ngram-draft-tokens 31 \
@@ -176,6 +177,21 @@ Measured via [`tools/niah_gate/niah_gate.py`](tools/niah_gate/niah_gate.py) (`--
 | **Calibration / Cold Prefill** (`11.7K` / `171.1K`) | — | `3.68k` / `3.51k tok/s` | — | — | `3.2s` / `48.9s` |
 | **Run 1** (`93.4%` cached tail `11.4K`) | **PASS (`2048/2048`, `dup=0`, `wrong=0`, `stop`)** | `3.25k tok/s` | `128.3 tok/s` | `97.3%` (`53,666/55,155` MTP+ngram) | `8m 5.8s` |
 | **Run 2** (`100.0%` cached hybrid snapshot) | **PASS (`2048/2048`, `dup=0`, `wrong=0`, `stop`)** | — | **`281.8 tok/s`** | `99.6%` (`59,043/59,306`, `52,145` ngram) | `3m 39.6s` |
+
+### Resident Decode Expert Tail-Skip (`--expert-tail-skip 8`)
+
+`tools/run_server.sh` defaults to `EXPERT_TAIL_SKIP=8` (`--expert-tail-skip 8`; set `EXPERT_TAIL_SKIP=0` for exact top-10 decode). This enables approximate tail-expert skipping on GB10's all-resident unstaged OMMA verify path:
+
+- **Decode-only (prefill stays full top-10):** Experts are skipped **only during decode/verification (`T >= 2`)**; during prefill all `10` routed experts are still executed with no tail skipping.
+- **Batch-aware expert reuse:** Tail skipping is decided across the entire active verification batch rather than per individual token. If Request A routes an expert at tail rank `8` (or `9`), while Request B in the same batch routes that same expert at rank `2`, that expert's weights are already being loaded for Request B — so Request A receives it for free instead of skipping it. An expert is skipped (and its output zeroed) only when **every** token in the batch routes it at rank `>= 8`.
+- **Speed vs. quality trade-off:** Dropping rank `8`–`9` tail experts trades a small amount of model quality relative to exact top-10 (`0`) for higher memory-bandwidth efficiency at low/medium concurrency. More aggressive pruning (`--expert-tail-skip 7`) failed the 210K NIAH quick probe (`before_jag` premature EOS after 3 tokens), whereas `--expert-tail-skip 8` passed both the quick probe and the full 262K NIAH Gate.
+
+| Benchmark (`FastQ-RHT16`, `T=1.0`, `int8` KV) | Exact Default (`0`) | `--expert-tail-skip 8` | Delta |
+|---|---:|---:|---:|
+| `llama-benchy` `c1` (`d0 / d4096 / d8192`) | `85.1 / 84.6 / 82.4` (avg `84.0`) | **`95.0 / 89.3 / 86.7`** (avg **`90.3`**) | **`+7.5%`** |
+| `llama-benchy` `c2` (`d0 / d4096 / d8192`) | `109.5 / 113.4 / 106.3` (avg `109.7`) | **`118.4 / 114.6 / 118.9`** (avg **`117.3`**) | **`+6.9%`** |
+| `llama-benchy` `c4` (`d0 / d4096 / d8192`) | **`179.3 / 174.9 / 176.4`** (avg **`176.9`**) | `169.4 / 166.6 / 173.0` (avg `169.7`) | `-4.1%` |
+| `262K` NIAH Gate (`seed=1234`, `2048` needles) | **PASS (`2048/2048`)** @ `129.3 tok/s` (`97.3%`) | **PASS (`2048/2048`)** @ **`140.5 tok/s`** (`97.7%`) | **`+8.7%`** |
 
 ### `tool-eval-bench` Results (`HC4-W4Dense`, `tool-eval-bench v3.0.1.dev10+g1cd7309e5`)
 

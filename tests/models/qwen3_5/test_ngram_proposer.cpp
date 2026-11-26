@@ -269,10 +269,10 @@ int main() {
             const std::array<ToolCallOutputContract::Tool, 2> tools{t0, t1};
             const auto skeletons = ngram_tool_schema_sources(tools);
             require(skeletons == std::vector<std::string>{
-                                     "\n<function=read_csv_slice>\n<parameter=path>\n",
+                                     "<tool_call>\n<function=read_csv_slice>\n<parameter=path>\n",
                                      "\n</parameter>\n<parameter=start_row>\n",
-                                     "\n<function=ping>\n</function>\n",
-                                     "\n</parameter>\n</function>\n",
+                                     "<tool_call>\n<function=ping>\n</function>\n</tool_call>",
+                                     "\n</parameter>\n</function>\n</tool_call>",
                                  },
                     "tool schema skeletons must match qwen3_8 XML format");
         }

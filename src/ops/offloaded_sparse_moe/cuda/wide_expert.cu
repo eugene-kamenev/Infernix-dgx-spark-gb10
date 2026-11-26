@@ -34,11 +34,11 @@ void check_launch(const char* what) {
 // When staging is disabled (staging_slots == 0 && fetch.request == nullptr), also resolves
 // job_records[job] directly so unstaged calls can omit the redundant stage_kernel launch.
 __global__ void __launch_bounds__(kPlanThreads)
-    plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int max_jobs, int pass_jobs, int passes,
-                const std::int32_t* __restrict__ cpu_flags, const std::uint8_t** __restrict__ job_records,
-                std::int32_t* __restrict__ tiles, std::int32_t* __restrict__ pass_tiles,
-                std::int32_t* __restrict__ narrow_jobs, std::int32_t* __restrict__ pass_narrow,
-                std::int32_t* __restrict__ entry_map, int entry_map_ints) {
+    plan_kernel(MoeDispatch dispatch, MoeExpertSource source, int top_k, int max_jobs, int pass_jobs, int passes,
+                const std::int32_t* __restrict__ cpu_flags, std::int32_t* __restrict__ tail_flags,
+                const std::uint8_t** __restrict__ job_records, std::int32_t* __restrict__ tiles,
+                std::int32_t* __restrict__ pass_tiles, std::int32_t* __restrict__ narrow_jobs,
+                std::int32_t* __restrict__ pass_narrow, std::int32_t* __restrict__ entry_map, int entry_map_ints) {
     __shared__ int scan[kPlanThreads];
     __shared__ int base;
     __shared__ int narrow_base;
@@ -55,13 +55,25 @@ __global__ void __launch_bounds__(kPlanThreads)
         int n         = 0;
         int nn        = 0;
         if (job < jobs) {
-            const bool on_gpu = (cpu_flags == nullptr || cpu_flags[job] == 0);
             const int expert  = dispatch.jobs[job];
-            const int columns = dispatch.offsets[expert + 1] - dispatch.offsets[expert];
-            if (wide_route(columns, source.scales[expert])) {
-                n = (columns + kTileColumns - 1) / kTileColumns;
-            } else if (on_gpu) {
-                nn = 1;
+            const int first   = dispatch.offsets[expert];
+            const int columns = dispatch.offsets[expert + 1] - first;
+            bool tail         = false;
+            if (tail_flags != nullptr) {
+                tail = columns <= kMaxColumns;
+                for (int c = 0; c < columns && tail; ++c) {
+                    const int entry = dispatch.entries[first + c];
+                    tail            = entry < dispatch.shared_first && (entry % top_k) >= source.tail_skip_rank;
+                }
+                tail_flags[job] = tail ? 2 : 0;
+            }
+            const bool on_gpu = !tail && (cpu_flags == nullptr || cpu_flags[job] == 0);
+            if (!tail) {
+                if (wide_route(columns, source.scales[expert])) {
+                    n = (columns + kTileColumns - 1) / kTileColumns;
+                } else if (on_gpu) {
+                    nn = 1;
+                }
             }
             if (resolve_rec && on_gpu) { job_records[job] = resolve_unstaged_record(source, expert); }
         }
@@ -876,11 +888,14 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.outputs     = static_cast<std::uint16_t*>(outputs.data);
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
     call.mean_job_columns = entries / max_jobs;
-    const bool cpu        = source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
+    const bool cpu = source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
+    const bool resident_tail_skip = !cpu && source.tail_skip_rank > 0 && source.staging_slots == 0 &&
+                                    source.fetch.request == nullptr && x.ne[1] >= 2 && x.ne[1] <= kMaxColumns;
     const bool map_tokens = source.activation == ExpertActivation::kA4 && source.wide_a16 != WideA16::kLossless &&
                             entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr;
-    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, max_jobs, pass_jobs, call.passes,
-                                                cpu ? workspace.cpu_flags : nullptr, workspace.job_records,
+    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, top_k, max_jobs, pass_jobs, call.passes,
+                                                cpu ? workspace.cpu_flags : nullptr,
+                                                resident_tail_skip ? workspace.cpu_flags : nullptr, workspace.job_records,
                                                 workspace.tiles, workspace.pass_tiles, workspace.narrow_jobs,
                                                 workspace.pass_narrow, map_tokens ? workspace.entry_map : nullptr,
                                                 map_tokens ? entries * 2 : 0);
@@ -991,9 +1006,12 @@ void prepare_xplane(const Tensor& x, const MoeDispatch& dispatch, const MoeExper
     const int tokens  = static_cast<int>(x.ne[1]);
     const int entries = tokens * top_k;
     const int passes  = (max_jobs + pass_jobs - 1) / pass_jobs;
-    const bool cpu    = source.cpu.max_jobs > 0 && tokens <= source.cpu.max_columns;
-    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, max_jobs, pass_jobs, passes,
-                                                cpu ? workspace.cpu_flags : nullptr, workspace.job_records,
+    const bool cpu = source.cpu.max_jobs > 0 && tokens <= source.cpu.max_columns;
+    const bool resident_tail_skip = !cpu && source.tail_skip_rank > 0 && source.staging_slots == 0 &&
+                                    source.fetch.request == nullptr && tokens >= 2 && tokens <= kMaxColumns;
+    plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, top_k, max_jobs, pass_jobs, passes,
+                                                cpu ? workspace.cpu_flags : nullptr,
+                                                resident_tail_skip ? workspace.cpu_flags : nullptr, workspace.job_records,
                                                 workspace.tiles, workspace.pass_tiles, workspace.narrow_jobs,
                                                 workspace.pass_narrow, workspace.entry_map, entries * 2);
     check_launch("plan xplane");

@@ -1016,6 +1016,145 @@ void test_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t
     cuda_check(cudaFreeHost(host), "cudaFreeHost");
 }
 
+void test_resident_tail_skip(int experts, int columns, int top_k, int rank, std::uint32_t seed) {
+    std::mt19937 rng(seed);
+    std::vector<fixtures::Expert> bank;
+    std::vector<moe::ExpertScales> scales;
+    std::vector<std::uint8_t> frame_bytes;
+    std::vector<std::int32_t> frames(experts);
+    frame_bytes.reserve(static_cast<std::size_t>(experts) * moe::kRecordBytes);
+    for (int e = 0; e < experts; ++e) {
+        bank.push_back(fixtures::random_expert(rng, e % 3 == 0));
+        scales.push_back(bank.back().scales);
+        frames[e] = e;
+        frame_bytes.insert(frame_bytes.end(), bank.back().record.begin(), bank.back().record.end());
+    }
+    auto* d_frame_base = device_copy(frame_bytes);
+    auto* d_frames     = device_copy(frames);
+    auto* d_scales     = device_copy(scales);
+    std::normal_distribution<float> n(0.0F, 1.0F);
+    std::vector<float> logits(static_cast<std::size_t>(experts + 1) * columns);
+    for (auto& v : logits) { v = n(rng); }
+    auto* d_logits       = device_copy(logits);
+    std::int32_t* d_ids  = nullptr;
+    float* d_weights     = nullptr;
+    float* d_shared_gate = nullptr;
+    cuda_check(cudaMalloc(&d_ids, sizeof(std::int32_t) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_weights, sizeof(float) * top_k * columns), "cudaMalloc");
+    cuda_check(cudaMalloc(&d_shared_gate, sizeof(float) * columns), "cudaMalloc");
+    infernix::ops::MoeRouting routing{Tensor(d_ids, DType::I32, {top_k, columns}),
+                                    Tensor(d_weights, DType::FP32, {top_k, columns}),
+                                    Tensor(d_shared_gate, DType::FP32, {columns})};
+    const Tensor t_logits(d_logits, DType::FP32, {experts + 1, columns});
+    infernix::ops::moe_route(t_logits, top_k, routing, nullptr);
+    void* d_dispatch = nullptr;
+    cuda_check(cudaMalloc(&d_dispatch, infernix::ops::moe_dispatch_bytes(experts, top_k * columns)), "cudaMalloc");
+    auto dispatch = infernix::ops::carve_moe_dispatch(d_dispatch, experts, top_k * columns);
+    const auto x  = fixtures::random_activations(rng, columns);
+    auto* d_x     = device_copy(x);
+    std::vector<std::int32_t> ids(static_cast<std::size_t>(top_k) * columns);
+    cuda_check(cudaMemcpy(ids.data(), d_ids, ids.size() * sizeof(std::int32_t), cudaMemcpyDeviceToHost), "cudaMemcpy");
+
+    std::vector<int> expert_columns(experts, 0), best_slot(experts, top_k);
+    for (std::size_t i = 0; i < ids.size(); ++i) {
+        ++expert_columns[ids[i]];
+        best_slot[ids[i]] = std::min(best_slot[ids[i]], static_cast<int>(i % top_k));
+    }
+    const auto skipped = [&](int e) {
+        return expert_columns[e] <= moe::kMaxColumns && best_slot[e] >= rank;
+    };
+    int skipped_entries = 0, kept_entries = 0;
+    for (const int e : ids) {
+        if (skipped(e)) {
+            ++skipped_entries;
+        } else {
+            ++kept_entries;
+        }
+    }
+    check(skipped_entries > 0 && kept_entries > 0, "resident tail-skip case skips some entries and keeps others");
+
+    const int max_jobs = std::min(experts, top_k * columns);
+    void* d_workspace  = nullptr;
+    cuda_check(cudaMalloc(&d_workspace, infernix::ops::moe_experts_workspace_bytes(
+                                            infernix::ops::offloaded_moe::kFlashNextShape, max_jobs, top_k * columns,
+                                            columns, moe::ExpertActivation::kA4)),
+               "cudaMalloc");
+    const std::size_t out_elems = static_cast<std::size_t>(moe::kHidden) * top_k * columns;
+    std::uint16_t* d_out        = nullptr;
+    cuda_check(cudaMalloc(&d_out, out_elems * sizeof(std::uint16_t)), "cudaMalloc");
+    Tensor tx(d_x, DType::BF16, {moe::kHidden, columns});
+    Tensor out(d_out, DType::BF16, {moe::kHidden, top_k * columns});
+
+    auto run_with_rank = [&](int tail_rank) {
+        infernix::ops::moe_dispatch(routing, experts, dispatch, nullptr, nullptr);
+        cuda_check(cudaMemset(d_out, 0xFF, out_elems * sizeof(std::uint16_t)), "cudaMemset");
+        infernix::ops::MoeExpertSource source{.frame_base    = d_frame_base,
+                                              .frames        = d_frames,
+                                              .host_records  = d_frame_base,
+                                              .record_stride = moe::kRecordBytes,
+                                              .scales        = d_scales,
+                                              .staging_slots = 0,
+                                              .cpu           = {}};
+        source.tail_skip_rank = tail_rank;
+        source.omma_narrow    = true;
+        infernix::ops::moe_experts(tx, dispatch, source, top_k, max_jobs, d_workspace, out, nullptr, false, false);
+        infernix::ops::moe_experts_cpu_wait(tx, dispatch, source, max_jobs, d_workspace, out, nullptr);
+        cuda_check(cudaDeviceSynchronize(), "resident moe_experts");
+        std::vector<std::uint16_t> got(out_elems);
+        cuda_check(cudaMemcpy(got.data(), d_out, out_elems * sizeof(std::uint16_t), cudaMemcpyDeviceToHost),
+                   "cudaMemcpy");
+        return got;
+    };
+
+    const auto ref = run_with_rank(0);
+    const auto got = run_with_rank(rank);
+    const auto to_f32 = [](std::uint16_t b) {
+        const std::uint32_t w = static_cast<std::uint32_t>(b) << 16;
+        float f               = 0.0F;
+        std::memcpy(&f, &w, sizeof(f));
+        return f;
+    };
+    long zero_fail = 0, kept_bit_fail = 0, oracle_over = 0;
+    for (int t = 0; t < columns; ++t) {
+        for (int s = 0; s < top_k; ++s) {
+            const std::size_t col = static_cast<std::size_t>(t) * top_k + s;
+            const int e           = ids[col];
+            const std::size_t off = col * moe::kHidden;
+            if (skipped(e)) {
+                for (int i = 0; i < moe::kHidden; ++i) { zero_fail += got[off + i] != 0U ? 1 : 0; }
+            } else {
+                for (int i = 0; i < moe::kHidden; ++i) {
+                    kept_bit_fail += got[off + i] != ref[off + i] ? 1 : 0;
+                }
+                const auto oracle =
+                    cpu_column(bank[e], &x[static_cast<std::size_t>(t) * moe::kHidden], moe::ExpertActivation::kA4);
+                double err = 0.0, norm = 0.0;
+                for (int i = 0; i < moe::kHidden; ++i) {
+                    const double g = to_f32(got[off + i]);
+                    const double o = to_f32(oracle[i]);
+                    err += (g - o) * (g - o);
+                    norm += o * o;
+                }
+                const double rel = norm > 0.0 ? std::sqrt(err / norm) : std::sqrt(err);
+                if (rel > 0x1p-4) { ++oracle_over; }
+            }
+        }
+    }
+    std::printf("Resident E=%d T=%d k=%d tail skip %d: %d skipped, %d kept, zero_fail=%ld, kept_bit_fail=%ld, "
+                "oracle_over=%ld\n",
+                experts, columns, top_k, rank, skipped_entries, kept_entries, zero_fail, kept_bit_fail, oracle_over);
+    check(zero_fail == 0, "resident tail skip zeroes skipped experts outputs");
+    check(kept_bit_fail == 0, "resident tail skip keeps non-skipped OMMA bits identical");
+    check(oracle_over == 0, "resident tail skip kept outputs within 2^-4 relative L2 of CPU oracle");
+
+    for (void* p : {static_cast<void*>(d_frame_base), static_cast<void*>(d_frames), static_cast<void*>(d_scales),
+                    static_cast<void*>(d_logits), static_cast<void*>(d_ids), static_cast<void*>(d_weights),
+                    static_cast<void*>(d_shared_gate), d_dispatch, static_cast<void*>(d_x), d_workspace,
+                    static_cast<void*>(d_out)}) {
+        cuda_check(cudaFree(p), "cudaFree");
+    }
+}
+
 void test_dispatch(int experts, int entries, std::uint32_t seed) {
     std::mt19937 rng(seed);
     std::uniform_int_distribution<int> pick(0, experts - 1);
@@ -1718,6 +1857,7 @@ INFERNIX_OP_TEST(offloaded_moe_layer) {
             test_tail_skip(48, 1, 10, 7, 401);  // decode: one column, Strata's default rank
             test_tail_skip(48, 6, 10, 5, 403);  // MTP verification width: an expert skips only if every column ranks it low
             test_tail_skip(96, 16, 10, 8, 409); // two verify rows: past the fork route, wide experts never skipped
+            test_resident_tail_skip(48, 6, 10, 7, 419); // resident unstaged OMMA verify round: tail-skip rank 7
         }
         // W4A16 experts (§16.2.1): decode, verification, several columns per expert, many misses, and
         // a short prompt's call. The narrow jobs of calls of at most 64 columns take the tensor-core narrow

@@ -43,6 +43,7 @@
 #   NGRAM_MIN_MATCH (default: 8), INFERNIX_NGRAM_WIDTH_COST (optional override)
 #   THINKING_FLAG (default: empty), REASONING_EFFORT (default: medium)
 #   EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
+#   EXPERT_TAIL_SKIP (default: 8; set 0 for exact top-10 without tail skip)
 #   SKIP_BUILD=1 to skip rebuilding infernix-serve
 #
 
@@ -74,6 +75,7 @@ MAX_CONCURRENCY="${MAX_CONCURRENCY:-8}"
 EXPLICIT_MODEL_ID=""
 MODEL_ALIAS="${MODEL_ALIAS:-}"
 EXPERT_A4_DEFAULT=0
+EXPERT_TAIL_SKIP="${EXPERT_TAIL_SKIP:-8}"
 VISION_DEFAULT=1
 
 # Parse options
@@ -262,6 +264,7 @@ echo " Listen Endpoint : http://${HOST}:${PORT}/v1"
 echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
 echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (${NGRAM_DRAFT_TOKENS} drafts, min-match ${NGRAM_MIN_MATCH})"
+echo " Expert Tail-Skip: ${EXPERT_TAIL_SKIP}"
 echo "========================================================================================"
 echo
 
@@ -273,6 +276,11 @@ fi
 EXPERT_A4_ARGS=()
 if [[ "${EXPERT_A4_ACTIVATIONS:-${EXPERT_A4_DEFAULT}}" == "1" ]]; then
     EXPERT_A4_ARGS=(--expert-a4-activations)
+fi
+
+EXPERT_TAIL_SKIP_ARGS=()
+if [[ "${EXPERT_TAIL_SKIP}" != "0" ]]; then
+    EXPERT_TAIL_SKIP_ARGS=(--expert-tail-skip "${EXPERT_TAIL_SKIP}")
 fi
 
 VISION_ARGS=()
@@ -302,6 +310,7 @@ fi
 
 exec "${BINARY_PATH}" "${MODEL_PATH}" \
     "${EXPERT_A4_ARGS[@]}" \
+    "${EXPERT_TAIL_SKIP_ARGS[@]}" \
     "${VISION_ARGS[@]}" \
     "${SPEC_ARGS[@]}" \
     --ngram-volume "${NGRAM_PATH}" \

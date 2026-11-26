@@ -27,15 +27,15 @@ ngram_tool_schema_sources(std::span<const ToolCallOutputContract::Tool> tools) {
     for (const auto& tool : tools) {
         if (tool.name.empty()) { continue; }
         if (tool.parameters.empty()) {
-            sources.push_back("\n<function=" + tool.name + ">\n</function>\n");
+            sources.push_back("<tool_call>\n<function=" + tool.name + ">\n</function>\n</tool_call>");
             continue;
         }
-        sources.push_back("\n<function=" + tool.name + ">\n<parameter=" + tool.parameters[0].name + ">\n");
+        sources.push_back("<tool_call>\n<function=" + tool.name + ">\n<parameter=" + tool.parameters[0].name + ">\n");
         for (std::size_t i = 1; i < tool.parameters.size(); ++i) {
             sources.push_back("\n</parameter>\n<parameter=" + tool.parameters[i].name + ">\n");
         }
     }
-    if (!sources.empty()) { sources.push_back("\n</parameter>\n</function>\n"); }
+    if (!sources.empty()) { sources.push_back("\n</parameter>\n</function>\n</tool_call>"); }
     return sources;
 }
 

@@ -294,7 +294,7 @@ int run_case(int tokens, int context_length, InputProfile profile = InputProfile
                                                           static_cast<std::uint32_t>(envelope_max)};
     const std::size_t workspace_bytes = ops::context_softmax_attention_workspace_capacity_bytes(
         kGeometry, envelope, tokens, tokens, 1);
-    DeviceArena workspace(workspace_bytes);
+    DeviceArena workspace(std::max<std::size_t>(256, workspace_bytes));
 
     ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
                                    valid_tensor, table_row_tensor, kGeometry, kScale, context,
@@ -415,8 +415,9 @@ int graph_mapping_replay_case() {
     PagedKVBatchLayerView context =
         make_context_view(d_context_k, d_context_v, d_table, logical_pages, physical_pages);
     constexpr ops::ContextAttentionExecutionEnvelope envelope{0, context_length};
-    DeviceArena workspace(ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, envelope, tokens, tokens, 1));
+    DeviceArena workspace(std::max<std::size_t>(
+        256, ops::context_softmax_attention_workspace_capacity_bytes(
+                 kGeometry, envelope, tokens, tokens, 1)));
 
     cudaStream_t stream        = nullptr;
     cudaGraph_t graph          = nullptr;
@@ -554,8 +555,9 @@ int batch_table_case() {
                   expected.begin() + static_cast<std::ptrdiff_t>(b * row_q_count));
     }
 
-    DeviceArena workspace(ops::context_softmax_attention_workspace_capacity_bytes(
-        kGeometry, envelope, tokens, tokens, batch));
+    DeviceArena workspace(std::max<std::size_t>(
+        256, ops::context_softmax_attention_workspace_capacity_bytes(
+                 kGeometry, envelope, tokens, tokens, batch)));
     ops::context_softmax_attention(q_tensor, query_k_tensor, query_v_tensor, length_tensor,
                                    valid_tensor, table_row_tensor, kGeometry, kScale, context,
                                    envelope, workspace, out_tensor, nullptr);
