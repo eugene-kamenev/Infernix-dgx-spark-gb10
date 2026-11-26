@@ -82,7 +82,7 @@ INFERNIX_EXPERTS_ON_GPU=1 \
   --min-p 0.1 \
   --top-k 20 \
   --lm-head-draft \
-  --prefill-chunk 12288 \
+  --prefill-chunk 16384 \
   --kv-capacity 524288 \
   --default-max-tokens 32768 \
   --preserve-thinking \
@@ -194,7 +194,7 @@ Measured via [`tools/niah_gate/niah_gate.py`](tools/niah_gate/niah_gate.py) (`--
 Infernix provides two numerical execution routes:
 
 - **The exact route (`--disable-fast-paths`)**: Produces bit-identical output from run to run and release to release. Where an artifact's formats allow it, it is also request-invariant (concurrent requests, prefix-cache state, and memory pressure do not alter a request's output).
-- **Fast paths (enabled by default)**: Hardware-accelerated schedules and dynamic activation quantizations (`nvfp4-a4-pair`, `qsa-prepare-fused`, `gdn-f16-accumulate`, `sampled-mtp-drafts`, `adaptive-speculation`) that run only for the kernels they were qualified on, only after passing the numerical quality gate below, and only where measured faster on GB10.
+- **Fast paths (enabled by default)**: Hardware-accelerated schedules and dynamic activation quantizations (`nvfp4-a4-pair`, `qsa-prepare-fused`, `sampled-mtp-drafts`, `adaptive-speculation`) that run only for the kernels they were qualified on, only after passing the numerical quality gate below, and only where measured faster on GB10. On `FastQ-RHT16` (`NVFP4` dense + `W4A4` experts), `fp16-gdn-state`, `bf16-gdn-state`, and `gdn-f16-accumulate` remain opt-in (`--fast-path ...`) so the default route keeps FP32 GDN recurrent state and exact chunked GDN accumulation for 262K long-context stability.
 
 ### The Quality Gate
 Every fast path is qualified against a high-precision reference (16-bit activations in every layer and a BF16 KV cache) over a 1.04M-token teacher-forced prefill corpus and 1,024 forced decoding segments (65,536 scored positions):
