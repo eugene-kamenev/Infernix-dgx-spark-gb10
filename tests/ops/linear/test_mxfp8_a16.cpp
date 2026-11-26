@@ -52,8 +52,8 @@ int run_flash_next_mxfp8_a16() {
 // tiles on both sides of each.
 int mxfp8_a16_column_invariance() {
     int failures = 0;
-    for (const auto& [n, k, columns] : {std::tuple{16384, 2560, 4113}, std::tuple{13952, 2560, 1553},
-                                        std::tuple{2560, 6144, 1553}, std::tuple{1280, 2560, 3089},
+    for (const auto& [n, k, columns] : {std::tuple{16384, 2560, 4113}, std::tuple{13952, 2560, 4225},
+                                        std::tuple{2560, 6144, 2177}, std::tuple{1280, 2560, 3089},
                                         std::tuple{2560, 640, 2065}}) {
         // Every finite E4M3 code (the fixture) and activations over 25 binades, so FP32 sums round and
         // any difference in reduction order changes bits.
@@ -87,7 +87,8 @@ int mxfp8_a16_column_invariance() {
         for (const int t : {2,    5,    6,    7,    8,    9,    10,   12,   13,   15,   16,   17,   24,   31,   32,
                             33,   47,   48,   49,   63,   64,   65,   95,   96,   97,   127,  128,  129,  255,  256,
                             257,  383,  384,  385,  511,  512,  513,  767,  768,  769,  1023, 1024, 1025, 1041, 1535,
-                            1536, 1537, 1553, 2047, 2048, 2049, 2065, 3071, 3072, 3073, 3089, 4095, 4096, 4097, 4113}) {
+                            1536, 1537, 1553, 2047, 2048, 2049, 2065, 2177, 3071, 3072, 3073, 3089, 4095, 4096, 4097,
+                            4113, 4225}) {
             if (t > columns) { continue; }
             Tensor input(x, DType::BF16, {k, t});
             Tensor output(y, DType::BF16, {n, t});

@@ -1,12 +1,15 @@
 #include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen3_5/frontend/ngram_sources.h"
 
+#include <array>
 #include <iostream>
 #include <numeric>
 #include <random>
 
 using infernix::models::qwen3_5::detail::NgramProposer;
+using infernix::models::qwen3_5::frontend::ToolCallOutputContract;
 using infernix::models::qwen3_5::frontend::ngram_numbered_sources;
+using infernix::models::qwen3_5::frontend::ngram_tool_schema_sources;
 
 static void require(bool condition, const char* message) {
     if (!condition) { throw std::runtime_error(message); }
@@ -252,6 +255,24 @@ int main() {
             require(kv_match.matched == 4, "preserved valid match length");
             require(kv_match.tokens == std::vector<int>({200, 201, 202}),
                     "Suffix Automaton must preserve valid continuation when latest ends at boundary");
+        }
+        // Verify Qwen3.8 tool-schema skeleton generation.
+        {
+            require(ngram_tool_schema_sources({}).empty(), "empty tool list yields no skeletons");
+            ToolCallOutputContract::Tool t0;
+            t0.name = "read_csv_slice";
+            t0.parameters = {{.name = "path"}, {.name = "start_row"}};
+            ToolCallOutputContract::Tool t1;
+            t1.name = "ping";
+            const std::array<ToolCallOutputContract::Tool, 2> tools{t0, t1};
+            const auto skeletons = ngram_tool_schema_sources(tools);
+            require(skeletons == std::vector<std::string>{
+                                     "\n<function=read_csv_slice>\n<parameter=path>\n",
+                                     "\n</parameter>\n<parameter=start_row>\n",
+                                     "\n<function=ping>\n</function>\n",
+                                     "\n</parameter>\n</function>\n",
+                                 },
+                    "tool schema skeletons must match qwen3_8 XML format");
         }
 
         std::cout << "ngram CPU tests passed; oracle proposals=" << proposals << '\n';

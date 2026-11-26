@@ -1,15 +1,41 @@
 #pragma once
 
+#include "models/qwen3_5/frontend/tool_contract.h"
+
 #include <charconv>
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 namespace infernix::models::qwen3_5::frontend {
+
+// Synthesizes canonical Qwen3.8 XML tool-call skeleton spans from declared tools so the per-request
+// SuffixAutomaton can draft function/parameter boilerplate from Turn 1 onward without altering
+// prompt tokens or target probabilities.
+inline std::vector<std::string>
+ngram_tool_schema_sources(std::span<const ToolCallOutputContract::Tool> tools) {
+    std::vector<std::string> sources;
+    if (tools.empty()) { return sources; }
+    sources.reserve(tools.size() * 2 + 1);
+    for (const auto& tool : tools) {
+        if (tool.name.empty()) { continue; }
+        if (tool.parameters.empty()) {
+            sources.push_back("\n<function=" + tool.name + ">\n</function>\n");
+            continue;
+        }
+        sources.push_back("\n<function=" + tool.name + ">\n<parameter=" + tool.parameters[0].name + ">\n");
+        for (std::size_t i = 1; i < tool.parameters.size(); ++i) {
+            sources.push_back("\n</parameter>\n<parameter=" + tool.parameters[i].name + ">\n");
+        }
+    }
+    if (!sources.empty()) { sources.push_back("\n</parameter>\n</function>\n"); }
+    return sources;
+}
 
 // Called only for tool-result text. Recognize consecutive numbered runs, never
 // rewrite target messages. Preserve code indentation after exactly one separator.

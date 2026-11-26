@@ -367,6 +367,30 @@ __global__ __launch_bounds__(Schedule::kThreads, Schedule::kMinBlocksPerSm) void
 // reads the one staging buffer the staging kernel has just stored into, core/tma_descriptor_staging.cuh).
 inline constexpr int kMxfp8ProgrammaticTokens = 16;
 
+// Keep each grid's BF16 activation footprint within GB10's 24 MiB L2 cache so wide prefill calls
+// (e.g. T=8192..12288) do not thrash L2 across row tiles and re-read X from LPDDR5X. Single-slice
+// calls whose entire X fits in 24 MiB run in one launch without re-reading weights.
+template <class Launch>
+void for_each_mxfp8_token_slice(std::int32_t tokens, std::int32_t block_tokens, std::int32_t k, Launch&& launch) {
+    constexpr std::int64_t kSingleSliceL2Bytes = 24LL * 1024 * 1024;
+    constexpr std::int64_t kMultiSliceL2Bytes  = 20LL * 1024 * 1024;
+    const std::int64_t bytes_per_token         = static_cast<std::int64_t>(k) * 2;
+    const std::int64_t grid_cap                = static_cast<std::int64_t>(block_tokens) * kCudaGridYLimit;
+    if (static_cast<std::int64_t>(tokens) * bytes_per_token <= kSingleSliceL2Bytes && tokens <= grid_cap) {
+        launch(0, tokens);
+        return;
+    }
+    const std::int32_t l2_tokens = std::max(
+        block_tokens,
+        static_cast<std::int32_t>((kMultiSliceL2Bytes / bytes_per_token / block_tokens) * block_tokens));
+    const std::int32_t slice_cap = static_cast<std::int32_t>(std::min<std::int64_t>(l2_tokens, grid_cap));
+    for (std::int32_t offset = 0; offset < tokens;) {
+        const std::int32_t count = std::min(slice_cap, tokens - offset);
+        launch(offset, count);
+        offset += count;
+    }
+}
+
 template <class Schedule, class Output, class Epilogue>
 void launch_mxfp8_a16_tma_mma(const Mxfp8Operands& p, Output output, Epilogue epilogue, cudaStream_t stream) {
     validate_mxfp8_operands<Schedule>(p);
@@ -376,7 +400,7 @@ void launch_mxfp8_a16_tma_mma(const Mxfp8Operands& p, Output output, Epilogue ep
         // No tensor maps: every decode-width launch may be programmatic.
         const pdl::Dependency dependency =
             p.tokens <= kMxfp8ProgrammaticTokens ? pdl::Dependency::Programmatic : pdl::Dependency::Serialized;
-        for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+        for_each_mxfp8_token_slice(p.tokens, Schedule::kBlockTokens, p.k, [&](int offset, int count) {
             const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
             const auto launch = [&]<bool Full>() {
                 constexpr auto kernel = mxfp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue>;
@@ -412,7 +436,7 @@ void launch_mxfp8_a16_tma_mma(const Mxfp8Operands& p, Output output, Epilogue ep
             const pdl::Dependency dependency = fixed_maps && p.tokens <= kMxfp8ProgrammaticTokens
                                                    ? pdl::Dependency::Programmatic
                                                    : pdl::Dependency::Serialized;
-            for_each_token_slice(p.tokens, Schedule::kBlockTokens, [&](int offset, int count) {
+            for_each_mxfp8_token_slice(p.tokens, Schedule::kBlockTokens, p.k, [&](int offset, int count) {
                 const int blocks  = p.rows / Schedule::kBlockRows * div_up(count, Schedule::kBlockTokens);
                 const auto launch = [&]<bool Full>() {
                     constexpr auto kernel = mxfp8_a16_tma_mma_kernel<Schedule, Full, Output, Epilogue, InPlace>;

@@ -27,17 +27,17 @@ void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t
     if (tokens <= 32) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT16R32>>(x, weight, out, stream);
     if (tokens <= 64) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(x, weight, out, stream);
     if (tokens <= 128) return mxfp8_linear_a16_tma<Geometry, Fp8A16RingT64R128>(x, weight, out, stream);
-    if (tokens <= 512) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, stream);
-    if (tokens <= 2048) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, stream);
-    mxfp8_linear_a16_tma<Geometry, Mxfp8P4<Mxfp8TmaT64R256>>(x, weight, out, stream);
+    if (tokens <= 512) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R64G8>>(x, weight, out, stream);
+    if (tokens <= 2048) return mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128G8>>(x, weight, out, stream);
+    mxfp8_linear_a16_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R256G8>>(x, weight, out, stream);
 }
 
 // f16-accumulate-prefill: the GB10 tiles from launch_a16 at prefill widths (T >= kMxfp8F16MinTokens = 256).
 void launch_f16(const Tensor& x, const Weight& weight, Tensor& out, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
     const int tokens = x.ne[1];
-    if (tokens <= 512) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64>>(x, weight, out, scratch, stream);
-    if (tokens <= 2048) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, out, scratch, stream);
+    if (tokens <= 512) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT64R64G8>>(x, weight, out, scratch, stream);
+    if (tokens <= 2048) return mxfp8_linear_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128G8>>(x, weight, out, scratch, stream);
     mxfp8_linear_f16acc<Geometry, Mxfp8P4<Mxfp8TmaT64R256>>(x, weight, out, scratch, stream);
 }
 

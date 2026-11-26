@@ -34,15 +34,14 @@ void select_a16(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
     if (tokens <= 64) return mxfp8_tma<Geometry, Fp8A16RingT32R64S3>(p, output, stream);
     if (tokens <= 128) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(p, output, stream);
     if (tokens <= 192) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT64R128>>(p, output, stream);
-    if (tokens <= 4096) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
-    mxfp8_tma<Geometry, Mxfp8P4<Mxfp8TmaT16R128>>(p, output, stream);
+    mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128G8>>(p, output, stream);
 }
 
 // f16-accumulate-prefill: the GB10 TMA tile from select_a16 at prefill widths (T >= kMxfp8F16MinTokens = 256).
 template <class Output>
 void select_f16(const Tensor& x, const Weight& weight, Output output, F16AccumulateWorkspace scratch,
                 cudaStream_t stream) {
-    mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(x, weight, output, scratch, stream);
+    mxfp8_f16acc<Geometry, Mxfp8Tma<Mxfp8TmaT128R128G8>>(x, weight, output, scratch, stream);
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

@@ -940,6 +940,19 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
+        if (tool_call_output && !tool_call_output->tools.empty() && remaining > 0) {
+            std::size_t schema_budget = std::min<std::size_t>(remaining, 4096U);
+            for (const auto& skeleton : fi::ngram_tool_schema_sources(tool_call_output->tools)) {
+                fi::check_preparation_control(control, "ngram tool schema sources");
+                if (schema_budget == 0) { break; }
+                auto tokens = impl_->tokenizer->encode(
+                    skeleton, {.parse_added_tokens = false, .max_tokens = schema_budget});
+                fi::check_preparation_control(control, "ngram tool schema sources");
+                schema_budget -= tokens.size();
+                remaining -= tokens.size();
+                result.ngram_sources.push_back(std::move(tokens));
+            }
+        }
         for (const auto& message : messages) {
             if (remaining == 0) { break; }
             if (message.role != ChatRole::Tool) { continue; }

@@ -1219,7 +1219,9 @@ void launch_screen(const ScreenParams& p, int grid, cudaStream_t stream) {
     // sm_121a miscompiles per-instruction createpolicy + extern __shared__ into an invalid odd
     // LDGSTS desc[UR1], so hardware access-policy windows do the streaming isolation cleanly.)
     const ScreenL2PolicyProps l2 = screen_l2_policy_props();
-    if (l2.max_window_bytes > 0 && p.x != nullptr && p.columns > 0) {
+    const bool stream_evict_l2 =
+        static_cast<std::size_t>(p.rows) * (kCodeRowBytes + kScaleRowBytes) > (20ULL << 20);
+    if (stream_evict_l2 && l2.max_window_bytes > 0 && p.x != nullptr && p.columns > 0) {
         const auto addr     = [](const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); };
         const auto overlaps = [](std::uintptr_t a0, std::uintptr_t a1, std::uintptr_t b0, std::uintptr_t b1) {
             return a0 < b1 && b0 < a1;
@@ -1291,7 +1293,9 @@ void launch_screen_gmem_x(const ScreenParams& p, int grid, cudaStream_t stream) 
     }
 
     const ScreenL2PolicyProps l2 = screen_l2_policy_props();
-    if (l2.max_window_bytes > 0 && p.xq != nullptr && p.columns > 0) {
+    const bool stream_evict_l2 =
+        static_cast<std::size_t>(p.rows) * (kCodeRowBytes + kScaleRowBytes) > (20ULL << 20);
+    if (stream_evict_l2 && l2.max_window_bytes > 0 && p.xq != nullptr && p.columns > 0) {
         const auto addr     = [](const void* ptr) { return reinterpret_cast<std::uintptr_t>(ptr); };
         const auto overlaps = [](std::uintptr_t a0, std::uintptr_t a1, std::uintptr_t b0, std::uintptr_t b1) {
             return a0 < b1 && b0 < a1;
@@ -1503,7 +1507,9 @@ void screened_head_top(const Tensor& x, const Weight& head, const Weight& screen
     }
     auto scope          = workspace.scope();
     const Scratch scratch = allocate_scratch(workspace, T, policy.rescored);
-    const int grid      = run_screen<false, true>(screen_params(x, screen, valid_rows, scratch), stream);
+    ScreenParams params   = screen_params(x, screen, valid_rows, scratch);
+    params.rows           = std::min(R, ((valid_rows + kItemRows - 1) / kItemRows) * kItemRows);
+    const int grid        = run_screen<false, true>(params, stream);
     const TopParams top{.x            = static_cast<const bf16*>(x.data),
                         .codes        = static_cast<const std::uint8_t*>(head.qdata),
                         .scales       = static_cast<const __half*>(head.scales),
@@ -1585,6 +1591,7 @@ void screened_head_compact(const Tensor& x, const Tensor& bf16_head, const Weigh
     auto scope                   = workspace.scope();
     const Scratch scratch        = allocate_scratch(workspace, T, policy.rescored);
     ScreenParams params          = screen_params(x, screen, valid_rows, scratch);
+    params.rows                  = std::min(screen.n, ((valid_rows + kItemRows - 1) / kItemRows) * kItemRows);
     params.logits                = nullptr;
     params.partials              = nullptr;
     const int grid               = run_screen<false, false>(params, stream);

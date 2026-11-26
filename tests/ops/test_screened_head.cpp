@@ -1012,6 +1012,51 @@ void top_case(std::uint64_t seed) {
         const double screened = time_us([&] { infernix::ops::screened_head_top(x1, head, copy, R, policy, r1, l1, row_ids_tensor, t1, work, nullptr); });
         const double exact    = time_us([&] { infernix::ops::projection_fp32(x1, head, logits, nullptr); });
         std::cout << "top form T=1: screened " << screened << " us, exact head's projection alone " << exact << " us\n";
+        // Prefix scan (`valid_rows < R`): scanning only the first 4096 rows must never touch or
+        // return rows >= 4096 and must match exact BF16 ordering and token mapping over [0, 4096).
+        {
+            constexpr std::int32_t kPrefixRows = 4096;
+            DeviceArray<std::uint16_t> pdx(
+                std::vector<std::uint16_t>(columns.begin(), columns.begin() + static_cast<std::ptrdiff_t>(K) * 4));
+            const Tensor x4(pdx.p, DType::BF16, {K, 4});
+            const auto exact4 = exact_logits(x4, &head, nullptr, R);
+            DeviceArray<std::int32_t> pr(16), pr1(4), pt(4);
+            DeviceArray<float> plp(16), plp1(4);
+            Tensor pr_t(pr.p, DType::I32, {4, 4}), plp_t(plp.p, DType::FP32, {4, 4});
+            Tensor pr1_t(pr1.p, DType::I32, {1, 4}), plp1_t(plp1.p, DType::FP32, {1, 4}), pt_t(pt.p, DType::I32, {4});
+            Tensor unmapped;
+            infernix::ops::screened_head_top(x4, head, copy, kPrefixRows, policy, pr_t, plp_t, unmapped, unmapped,
+                                             work, nullptr);
+            infernix::ops::screened_head_top(x4, head, copy, kPrefixRows, policy, pr1_t, plp1_t, row_ids_tensor, pt_t,
+                                             work, nullptr);
+            cuda(cudaDeviceSynchronize(), "prefix sync");
+            const std::vector<std::int32_t> p_rows   = pr.host();
+            const std::vector<std::int32_t> p_rows1  = pr1.host();
+            const std::vector<std::int32_t> p_tokens = pt.host();
+            const ColumnScreen prefix_oracle0        = column_screen(screen, kPrefixRows, columns.data());
+            for (std::int32_t idx = 0; idx < 16; ++idx) {
+                check(p_rows[idx] >= 0 && p_rows[idx] < kPrefixRows,
+                      "top form prefix: returned row stays strictly within [0, valid_rows)");
+            }
+            for (std::int32_t t = 0; t < 4; ++t) {
+                check(p_rows1[t] == p_rows[t * 4] && p_tokens[t] == ids[p_rows1[t]],
+                      "top form prefix: rank-1 row and token mapping match");
+                for (int j = 1; j < 4; ++j) {
+                    const float vp = bf16_round(exact4[static_cast<std::size_t>(t) * R + p_rows[t * 4 + j - 1]]);
+                    const float vc = bf16_round(exact4[static_cast<std::size_t>(t) * R + p_rows[t * 4 + j]]);
+                    check(vp > vc || (vp == vc && p_rows[t * 4 + j - 1] < p_rows[t * 4 + j]),
+                          "top form prefix: returned rows are ordered by exact BF16 logit descending");
+                }
+            }
+            const auto top4_0 = top_rows(exact4, R, 0, kPrefixRows, 4);
+            for (int j = 0; j < 4; ++j) {
+                const bool in4 = std::find(p_rows.begin(), p_rows.begin() + 4, top4_0[j]) != p_rows.begin() + 4;
+                if (!in4) {
+                    check(selection_excludes(prefix_oracle0, top4_0[j], screen_grid_for(kPrefixRows, 4), policy),
+                          "top form prefix: admitted exact top-4 row within [0, 4096) appears");
+                }
+            }
+        }
     }
 }
 

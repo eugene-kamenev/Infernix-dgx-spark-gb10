@@ -33,9 +33,8 @@ void select(const Mxfp8Operands& p, Output output, cudaStream_t stream) {
     if (tokens <= 64) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT32R32>>(p, output, stream);
     if (tokens <= 128) return mxfp8_tma<Geometry, Mxfp8Tma<Fp8A16RingT32R64S3>>(p, output, stream);
     if (tokens <= 192) return mxfp8_tma<Geometry, Mxfp8P2<Mxfp8TmaT64R256>>(p, output, stream);
-    if (tokens <= 3072) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128>>(p, output, stream);
-    if (tokens <= 4096) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R256>>(p, output, stream);
-    mxfp8_tma<Geometry, Mxfp8P4<Mxfp8TmaT64R256>>(p, output, stream);
+    if (tokens <= 3072) return mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT128R128G8>>(p, output, stream);
+    mxfp8_tma<Geometry, Mxfp8Tma<Mxfp8TmaT64R256G8>>(p, output, stream);
 }
 
 void launch_a16(const Tensor& x, const Weight& weight, Tensor& out, cudaStream_t stream) {

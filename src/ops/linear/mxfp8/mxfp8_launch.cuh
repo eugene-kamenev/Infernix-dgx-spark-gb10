@@ -27,6 +27,10 @@ using Mxfp8TmaT32R32  = Fp8A16RingMmaSchedule<32, 32, 1, 4, 4, 2>;
 using Mxfp8TmaT64R64  = Fp8A16RingMmaSchedule<64, 64, 2, 4, 2, 2>;
 using Mxfp8TmaT64R256 = Fp8A16RingMmaSchedule<64, 256, 2, 8, 2, 1>;
 using Mxfp8TmaT128R128 = Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1>;
+using Mxfp8TmaT64R64G8   = Fp8A16RingMmaSchedule<64, 64, 2, 4, 2, 2, 128, Fp8MmaRaster::Grouped, 8>;
+using Mxfp8TmaT64R128G8  = Fp8A16RingMmaSchedule<64, 128, 2, 4, 3, 1, 128, Fp8MmaRaster::Grouped, 8>;
+using Mxfp8TmaT64R256G8  = Fp8A16RingMmaSchedule<64, 256, 2, 8, 2, 1, 128, Fp8MmaRaster::Grouped, 8>;
+using Mxfp8TmaT128R128G8 = Fp8A16RingMmaSchedule<128, 128, 4, 4, 2, 1, 128, Fp8MmaRaster::Grouped, 8>;
 
 // A schedule's cp.async producer spread over two or four warps (Mxfp8ProducerWarps): a full 16-token
 // tile and the prefill tiles issue more copies per stage than one warp keeps in flight.
