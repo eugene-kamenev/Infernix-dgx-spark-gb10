@@ -270,6 +270,8 @@ int main() {
                                   q::fast_path_applies(FastPath::QsaPrepareFused, config, options),
                               "qsa-prepare-fused is qualified where its kernel runs");
         }
+        failures += check(q::fast_path_qualified(FastPath::FreeCacheResume, {DenseKernels::Nvfp4, false, kv}),
+                          "free-cache-resume is qualified on NVFP4 dense with 16-bit expert activations");
         // NVIDIA FP4-Local, both expert activation precisions: speculation and cache resume by its joint
         // gate, preemption by its increment.
         for (const bool a4 : {false, true}) {

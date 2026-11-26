@@ -4940,7 +4940,7 @@ private:
     // The call planner's costs: the fitted call costs, and the walk's spans as walk_span_end forms them.
     [[nodiscard]] prefix::CallCost call_cost() const {
         return prefix::CallCost{.model            = options_.prefix_cost,
-                                .served_columns   = options_.device_experts ? 0U : 8U,
+                                .served_columns   = static_cast<std::uint32_t>(kServedCallColumns),
                                 .span_seconds     = options_.prefix_span_seconds,
                                 .walk_min_columns = static_cast<std::uint32_t>(kStreamMinColumns),
                                 .walk_max_tokens  = kWalkMaxTokens};
