@@ -462,9 +462,13 @@ struct ProgramOptions {
     // from its 2-bit screen (Parameters::output_head_screen); other rounds run the exact head. Each
     // round kind keeps its own CUDA graphs.
     bool screened_lm_head = false;
-    // fp16-gdn-state (FastPath::Fp16GdnState): the GDN recurrent state pool (and so its prefix-cache
-    // images) stores FP16; every GDN call keeps an FP32 master state and rounds the state it publishes.
+    // fp16-gdn-state / bf16-gdn-state: the GDN recurrent state pool (and so its prefix-cache
+    // images) stores FP16 or BF16; every GDN call keeps an FP32 master state and rounds the state it publishes.
     bool fp16_gdn_state = false;
+    bool bf16_gdn_state = false;
+    [[nodiscard]] DType gdn_recurrent_dtype() const noexcept {
+        return bf16_gdn_state ? DType::BF16 : (fp16_gdn_state ? DType::FP16 : DType::FP32);
+    }
     // block-verification (FastPath::BlockVerification): sampled rows of DFlash2 and sampled-MTP chain
     // rounds accept by block verification (ops::speculative_accept_sparse_drafts).
     bool block_verification = false;

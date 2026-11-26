@@ -15,6 +15,7 @@
 #include "ops/linear/mxfp8/mxfp8_shapes.h"
 #include "ops/linear/f16acc/f16acc_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
+#include "ops/linear/mxfp8/mxfp8_a8_tma_mma.cuh"
 #include "ops/linear/qsa_group.h"
 
 #include <stdexcept>
@@ -60,16 +61,37 @@ void launch_pair_block32(const Tensor& x, const Weight& weight, Tensor& out, Fp8
     fp8_a8_pair_block32_gemm<Geometry, true>(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
                                              scratch, stream);
 }
+
+template <class Output>
+void select_a8(const Tensor& x, const Weight& weight, Output output, Fp8A8Block32Workspace scratch,
+               cudaStream_t stream) {
+    if (x.ne[1] <= 256) return mxfp8_a8_gemm<Geometry, Mxfp8A8T64R64G8S3>(x, weight, output, scratch, stream);
+    mxfp8_a8_gemm<Geometry, Mxfp8A8T128R128G8S3>(x, weight, output, scratch, stream);
+}
+
+void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Block32Workspace scratch,
+               cudaStream_t stream) {
+    select_a8(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, scratch, stream);
+}
 } // namespace
 
-const Mxfp8LinearShape kMxfp8N13952K2560{13952, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN13952};
+const Mxfp8LinearShape kMxfp8N13952K2560{
+    13952, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN13952,
+    launch_a8, kMxfp8A8MinTokensN13952};
 
-// linear_qsa_group's MXFP8 route: mxfp8_dispatch's choice (f16-accumulate first, then the block32 pair,
-// from their admissions; `routes` already masked under column invariance), into the six segments.
+// linear_qsa_group's MXFP8 route: mxfp8_dispatch's choice (mxfp8-a8 first, then f16-accumulate, then
+// the block32 pair, from their admissions; `routes` already masked under column invariance), into the six segments.
 void mxfp8_qsa_group(const Tensor& x, const Weight& weight, const QsaGroupParts& parts, LinearRoutes routes,
                      WorkspaceArena* workspace, cudaStream_t stream) {
     const LinearBf16SegmentedOutput<6144, 6144, 512, 512, 512, 128> output{
         {parts.data[0], parts.data[1], parts.data[2], parts.data[3], parts.data[4], parts.data[5]}};
+    if (has_route(routes, LinearRoutes::Mxfp8A8) && x.ne[1] >= kMxfp8A8MinTokensN13952) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("mxfp8 qsa group: the mxfp8-a8 route requires caller workspace");
+        }
+        auto scope = workspace->scope();
+        return select_a8(x, weight, output, allocate_fp8_a8_block32_workspace(*workspace, x.ne[1], weight.k), stream);
+    }
     if (has_route(routes, LinearRoutes::F16Accumulate) && x.ne[1] >= kMxfp8F16MinTokens) {
         if (workspace == nullptr) {
             throw std::invalid_argument("mxfp8 qsa group: the f16-accumulate route requires caller workspace");

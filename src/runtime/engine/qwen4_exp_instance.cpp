@@ -323,9 +323,11 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
         std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                   FastPath::ScreenedLmHead) != options.fast_path_candidates.end() ||
         (options.fast_paths && plan.has_output_head_screen());
-    // fp16-gdn-state's smaller pool likewise (it is qualified nowhere, so only a candidate selects it).
+    // fp16-gdn-state / bf16-gdn-state's smaller pool likewise.
     program_options.fp16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
                                                FastPath::Fp16GdnState) != options.fast_path_candidates.end();
+    program_options.bf16_gdn_state = std::find(options.fast_path_candidates.begin(), options.fast_path_candidates.end(),
+                                               FastPath::Bf16GdnState) != options.fast_path_candidates.end();
 
     // The frame cache duplicates records that are already on device; it exists to hold experts
     // the pinned pool could not, and draws up to ~25-32 GiB of extra unified DRAM on an
@@ -605,6 +607,7 @@ ConstructedQwen4Exp construct_qwen4_exp(const EngineOptions& options, DeviceCont
     program_options.sampled_mtp_drafts = fast.selected(FastPath::SampledMtpDrafts);
     program_options.screened_lm_head   = fast.selected(FastPath::ScreenedLmHead);
     program_options.fp16_gdn_state     = fast.selected(FastPath::Fp16GdnState);
+    program_options.bf16_gdn_state     = fast.selected(FastPath::Bf16GdnState);
     program_options.block_verification = fast.selected(FastPath::BlockVerification);
     program_options.univer_trees =
         fast.selected(FastPath::UniverTrees) && !temporary_switches::flag("INFERNIX_TMP_NO_UNIVER_TREES");

@@ -13,6 +13,7 @@
 #include "ops/linear/mxfp8/mxfp8_shapes.h"
 #include "ops/linear/f16acc/f16acc_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
+#include "ops/linear/mxfp8/mxfp8_a8_tma_mma.cuh"
 
 namespace infernix::ops::detail {
 namespace {
@@ -48,7 +49,17 @@ void launch_pair_block32(const Tensor& x, const Weight& weight, Tensor& out, Fp8
     fp8_a8_pair_block32_gemm<Geometry, true>(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
                                              scratch, stream);
 }
+
+void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Block32Workspace scratch,
+               cudaStream_t stream) {
+    const LinearBf16Output output{static_cast<__nv_bfloat16*>(out.data), weight.n};
+    if (x.ne[1] <= 512) return mxfp8_a8_gemm<Geometry, Mxfp8A8T64R64G8S3>(x, weight, output, scratch, stream);
+    if (x.ne[1] <= 2048) return mxfp8_a8_gemm<Geometry, Mxfp8A8T128R64G8S3>(x, weight, output, scratch, stream);
+    mxfp8_a8_gemm<Geometry, Mxfp8A8T128R128G8S3>(x, weight, output, scratch, stream);
+}
 } // namespace
 
-const Mxfp8LinearShape kMxfp8N1280K2560{1280, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN1280};
+const Mxfp8LinearShape kMxfp8N1280K2560{
+    1280, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN1280,
+    launch_a8, kMxfp8A8MinTokensN1280};
 } // namespace infernix::ops::detail

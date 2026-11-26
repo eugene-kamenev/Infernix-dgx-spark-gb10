@@ -866,6 +866,65 @@ void check_cross_request_suffix_proposal() {
             "cross-request proposer remains accurate after sliding window compaction");
 }
 
+void check_dual_chain_trees_and_r1_cost_gate() {
+    using infernix::models::qwen4_exp::build_dual_chain_tree_row;
+    using infernix::models::qwen4_exp::kMaxDualChainSideLen;
+    using infernix::models::qwen4_exp::max_qsa_safe_side_len;
+    using infernix::models::qwen4_exp::should_graft_side_branch;
+    using infernix::ops::SpeculativeTreeRow;
+
+    // 1. QSA pooled-block safety invariant: no side token at pos+1..pos+side_len completes (p+1)%r==0.
+    require(max_qsa_safe_side_len(7, 1, 8) == 8, "ratio=1 imposes no pooled-block side limit");
+    for (std::int32_t r : {4, 16}) {
+        for (std::int32_t pos = 0; pos < 2 * r; ++pos) {
+            const std::int32_t safe = max_qsa_safe_side_len(pos, r, kMaxDualChainSideLen);
+            require(safe >= 0 && safe <= kMaxDualChainSideLen, "safe side length within bounds");
+            for (std::int32_t d = 1; d <= safe; ++d) {
+                require((pos + d + 1) % r != 0, "safe side token must never complete a QSA pooled block");
+            }
+            if (safe < kMaxDualChainSideLen) {
+                require((pos + safe + 2) % r == 0, "next excluded step must be exact pooled block boundary");
+            }
+        }
+    }
+
+    // 2. Dual-chain topology: main 0->1..5 and side 0->6->7->8->9->10.
+    SpeculativeTreeRow row{};
+    build_dual_chain_tree_row(row, 5, 5);
+    require(row.tree == 1 && row.main_depth == 5 && row.nodes == 11 && row.paths == 2,
+            "dual-chain tree row counts match 1 + main + side");
+    require(row.path_length[0] == 6 && row.path_length[1] == 6 && row.owned_from[1] == 1,
+            "dual-chain path lengths and ownership start match");
+    require(row.parent[1] == 0 && row.parent[5] == 4 && row.depth[5] == 5, "main chain parents/depths exact");
+    require(row.parent[6] == 0 && row.depth[6] == 1 && row.first_child[6] == 7 && row.sibling_index[6] == 1,
+            "side chain root link exact");
+    require(row.next_sibling[1] == 6, "root fork links main[1] next_sibling to side[6]");
+    for (std::int32_t k = 1; k < 5; ++k) {
+        const std::int32_t col = 6 + k;
+        require(row.parent[col] == col - 1 && row.depth[col] == 1 + k, "side chain sequential parent and depth");
+        require(row.path_columns[1][1 + k] == col, "path 1 columns track side chain");
+    }
+
+    // 3. Clamping by main_depth (tree compaction disjointness invariant c_i > main_depth >= depth) and node limits.
+    build_dual_chain_tree_row(row, 2, 6);
+    require(row.tree == 1 && row.main_depth == 2 && row.nodes == 5 && row.paths == 2 && row.path_length[1] == 3,
+            "dual-chain clamps side length to main_depth so depth[c] <= main_depth");
+    for (std::int32_t c = 0; c < row.nodes; ++c) {
+        require(row.depth[c] <= row.main_depth, "every live tree node satisfies depth <= main_depth");
+    }
+    build_dual_chain_tree_row(row, 15, 20);
+    require(row.nodes <= infernix::ops::kSpeculativeTreeMaxNodes && row.main_depth == 15 && row.nodes == 16 + 8,
+            "dual-chain side length clamped cleanly");
+
+    // 4. R1 MoE cost gate: admits strong multi-token structural chains, rejects weak/expensive branches.
+    require(should_graft_side_branch(4, 6, 0.85, 0.78, 6),
+            "R1 gate admits high-confidence structural side chain");
+    require(!should_graft_side_branch(4, 1, 0.25, 0.85, 4),
+            "R1 gate rejects weak 1-token side branch");
+    require(!should_graft_side_branch(4, 4, 0.70, 0.85, 60),
+            "R1 gate rejects branch when extra unique-expert cost blows up round time");
+}
+
 } // namespace
 
 int main() {
@@ -884,6 +943,7 @@ int main() {
         check_concurrent_staged_width_bucketing();
         check_dcut_batch_pruning();
         check_cross_request_suffix_proposal();
+        check_dual_chain_trees_and_r1_cost_gate();
     } catch (const std::exception& error) {
         std::fprintf(stderr, "FAIL: %s\n", error.what());
         return 1;

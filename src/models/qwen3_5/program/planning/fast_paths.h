@@ -59,6 +59,7 @@ struct FastPathConfiguration {
     case FastPath::Q5KSplitMma:
     case FastPath::Bf16PromptSplit:
     case FastPath::Fp16GdnState:
+    case FastPath::Bf16GdnState:
     case FastPath::BlockVerification:
     case FastPath::UniverTrees:
     case FastPath::GdnTreeClosedForm: return false;
@@ -83,6 +84,7 @@ struct FastPathConfiguration {
     case FastPath::IdleWidePrefill:
     case FastPath::GgmlBf16Prefill:
     case FastPath::F16AccumulatePrefill:
+    case FastPath::Mxfp8A8:
     case FastPath::RouterMma:
     case FastPath::ScreenedLmHead: return true;
     }

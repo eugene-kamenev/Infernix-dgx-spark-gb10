@@ -212,6 +212,48 @@ void launch_pair_block32_quantize(const Tensor& x, Fp8A8PairBlock32Workspace wor
         static_cast<int>(fp8_a8_pair_block32_scale_stride(x.ne[1]))));
 }
 
+template <int K, int Threads>
+__global__ void fp8_a8_block32_quantize_kernel(const __nv_bfloat16* __restrict__ input,
+                                               std::uint8_t* __restrict__ codes,
+                                               std::uint8_t* __restrict__ scales,
+                                               int scale_stride) {
+    static_assert(K % (2 * Threads) == 0 && K % kFp8A8PairBlock32K == 0);
+    constexpr int pairs_per_thread = (K / 2) / Threads;
+    pdl::enter();
+    const int token = static_cast<int>(blockIdx.x);
+    const int tid   = static_cast<int>(threadIdx.x);
+    const std::int64_t base = static_cast<std::int64_t>(token) * K;
+    const auto* input_pairs = reinterpret_cast<const std::uint32_t*>(input + base);
+    auto* code_pairs        = reinterpret_cast<std::uint16_t*>(codes + base);
+
+#pragma unroll
+    for (int item = 0; item < pairs_per_thread; ++item) {
+        const int pair            = tid + item * Threads;
+        const float2 value        = bf16x2_bits_to_float2(input_pairs[pair]);
+        const float block_maximum = half_warp_max(fmaxf(fabsf(value.x), fabsf(value.y)));
+        const int s               = block_maximum == 0.0F ? 0 : pair_exponent(block_maximum);
+        const float inverse       = power_of_two(-s);
+        const __nv_fp8x2_storage_t q = __nv_cvt_float2_to_fp8x2(
+            make_float2(value.x * inverse, value.y * inverse), __NV_SATFINITE, __NV_E4M3);
+        code_pairs[pair] = static_cast<std::uint16_t>(q);
+        if ((tid & 15) == 0) {
+            const int block = pair / 16;
+            const std::int64_t at =
+                (static_cast<std::int64_t>(block / 4) * scale_stride + token) * 4 + block % 4;
+            scales[at] = static_cast<std::uint8_t>(s + 127);
+        }
+    }
+}
+
+template <int K, int Threads>
+void launch_block32_quantize(const Tensor& x, Fp8A8Block32Workspace workspace, cudaStream_t stream) {
+    CUDA_CHECK(pdl::launch_consumer(
+        {dim3(x.ne[1]), dim3(Threads), 0, stream}, fp8_a8_block32_quantize_kernel<K, Threads>,
+        static_cast<const __nv_bfloat16*>(x.data), workspace.codes,
+        reinterpret_cast<std::uint8_t*>(workspace.block_scales),
+        static_cast<int>(fp8_a8_pair_block32_scale_stride(x.ne[1]))));
+}
+
 } // namespace
 
 void launch_fp8_a8_pair_quantize(const Tensor& x, const Weight& weight,
@@ -245,6 +287,22 @@ void launch_fp8_a8_pair_block32_quantize(const Tensor& x, const Weight& weight,
     case 6144: return launch_pair_block32_quantize<6144, 256>(x, workspace, stream);
     case 640: return launch_pair_block32_quantize<640, 160>(x, workspace, stream);
     default: throw std::invalid_argument("fp8 A8 pair block32 quantize: unsupported K");
+    }
+}
+
+void launch_fp8_a8_block32_quantize(const Tensor& x, const Weight& weight,
+                                    Fp8A8Block32Workspace workspace, cudaStream_t stream) {
+    if (workspace.codes == nullptr || workspace.block_scales == nullptr) {
+        throw std::invalid_argument("fp8 A8 block32 requires caller workspace");
+    }
+    if (x.ne[0] != weight.k || x.ne[1] <= 0) {
+        throw std::invalid_argument("fp8 A8 block32 quantize: activation does not match K");
+    }
+    switch (weight.k) {
+    case 2560: return launch_block32_quantize<2560, 256>(x, workspace, stream);
+    case 6144: return launch_block32_quantize<6144, 256>(x, workspace, stream);
+    case 640: return launch_block32_quantize<640, 160>(x, workspace, stream);
+    default: throw std::invalid_argument("fp8 A8 block32 quantize: unsupported K");
     }
 }
 

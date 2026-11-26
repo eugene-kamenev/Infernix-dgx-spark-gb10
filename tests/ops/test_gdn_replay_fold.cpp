@@ -826,11 +826,16 @@ int run_record_fold_rounds() {
     return failures;
 }
 
-// fp16-gdn-state through verification and its fold. From a state FP16 represents exactly, the record reads an
-// FP16 pool exactly (its outputs and records bit-equal the FP32 pool's), and the fold publishes the FP32
-// pool's folded state rounded once to nearest FP16 (saturating), with the same convolution history; the
-// source slot is unchanged. Qwen3.5-27B's 48x48 geometry, one row.
-int run_fp16_state_record_fold() {
+// fp16-gdn-state / bf16-gdn-state through verification and its fold. From a state representable
+// in the 16-bit dtype, the record reads it exactly and the fold publishes the FP32 fold rounded once.
+int run_half_state_record_fold(DType half_dtype) {
+    const std::string tag            = half_dtype == DType::BF16 ? "bf16" : "fp16";
+    const auto to_half16 = [&](float value) {
+        return half_dtype == DType::BF16 ? f32_to_bf16(value) : f32_to_fp16_saturated(value);
+    };
+    const auto to_f32_from_half16 = [&](std::uint16_t bits) {
+        return half_dtype == DType::BF16 ? bf16_to_f32(bits) : fp16_to_f32(bits);
+    };
     constexpr FoldProfile kProfile{48, 48, 10240};
     constexpr std::int32_t kWidth = 8, kSlots = 2, kSource = 0, kDestination = 1, kCommit = 5;
     const float kScale = 1.0F / std::sqrt(128.0F);
@@ -902,7 +907,7 @@ int run_fp16_state_record_fold() {
         for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
             std::vector<float> values(slot_elements);
             for (std::size_t i = 0; i < slot_elements; ++i) {
-                values[i] = fp16_to_f32(f32_to_fp16_saturated(
+                values[i] = to_f32_from_half16(to_half16(
                     bf16_to_f32(bf16_pattern(4401U + layer * 101U + static_cast<std::uint32_t>(i), 0.02F))));
             }
             const Tensor slot = pool.states->recurrent_slot(static_cast<std::uint32_t>(layer), kSource);
@@ -910,8 +915,8 @@ int run_fp16_state_record_fold() {
                 cuda_check(cudaMemcpy(slot.data, values.data(), slot.bytes(), cudaMemcpyHostToDevice), "FP32 state");
             } else {
                 std::vector<std::uint16_t> bits(slot_elements);
-                for (std::size_t i = 0; i < slot_elements; ++i) { bits[i] = f32_to_fp16_saturated(values[i]); }
-                cuda_check(cudaMemcpy(slot.data, bits.data(), slot.bytes(), cudaMemcpyHostToDevice), "FP16 state");
+                for (std::size_t i = 0; i < slot_elements; ++i) { bits[i] = to_half16(values[i]); }
+                cuda_check(cudaMemcpy(slot.data, bits.data(), slot.bytes(), cudaMemcpyHostToDevice), "half state");
             }
         }
         pool.out = DeviceBuffer(value_elements * kProfile.layers * sizeof(std::uint16_t));
@@ -931,15 +936,15 @@ int run_fp16_state_record_fold() {
         return pool;
     };
     Pool fp32 = make_pool(DType::FP32);
-    Pool fp16 = make_pool(DType::FP16);
+    Pool half = make_pool(half_dtype);
     int failures = 0;
-    if (from_device<std::uint16_t>(fp32.out, fp32.out.bytes / 2) != from_device<std::uint16_t>(fp16.out, fp16.out.bytes / 2)) {
-        std::cerr << "fp16 state record outputs differ from the FP32 pool's\n";
+    if (from_device<std::uint16_t>(fp32.out, fp32.out.bytes / 2) != from_device<std::uint16_t>(half.out, half.out.bytes / 2)) {
+        std::cerr << tag << " state record outputs differ from the FP32 pool's\n";
         ++failures;
     }
     if (from_device<std::uint8_t>(fp32.record_storage, fp32.record_storage.bytes) !=
-        from_device<std::uint8_t>(fp16.record_storage, fp16.record_storage.bytes)) {
-        std::cerr << "fp16 state records differ from the FP32 pool's\n";
+        from_device<std::uint8_t>(half.record_storage, half.record_storage.bytes)) {
+        std::cerr << tag << " state records differ from the FP32 pool's\n";
         ++failures;
     }
     for (std::int32_t layer = 0; layer < kProfile.layers; ++layer) {
@@ -947,26 +952,26 @@ int run_fp16_state_record_fold() {
         const std::vector<float> folded =
             from_device<float>(fp32.states->recurrent_slot(index, kDestination).data, slot_elements);
         std::vector<std::uint16_t> rounded(slot_elements);
-        for (std::size_t i = 0; i < slot_elements; ++i) { rounded[i] = f32_to_fp16_saturated(folded[i]); }
-        if (from_device<std::uint16_t>(fp16.states->recurrent_slot(index, kDestination).data, slot_elements) != rounded) {
-            std::cerr << "fp16 state fold is not the FP32 fold rounded once, layer " << layer << '\n';
+        for (std::size_t i = 0; i < slot_elements; ++i) { rounded[i] = to_half16(folded[i]); }
+        if (from_device<std::uint16_t>(half.states->recurrent_slot(index, kDestination).data, slot_elements) != rounded) {
+            std::cerr << tag << " state fold is not the FP32 fold rounded once, layer " << layer << '\n';
             return failures + 1;
         }
         const std::vector<float> source = from_device<float>(fp32.states->recurrent_slot(index, kSource).data, slot_elements);
         std::vector<std::uint16_t> source_bits(slot_elements);
-        for (std::size_t i = 0; i < slot_elements; ++i) { source_bits[i] = f32_to_fp16_saturated(source[i]); }
-        if (from_device<std::uint16_t>(fp16.states->recurrent_slot(index, kSource).data, slot_elements) != source_bits) {
-            std::cerr << "fp16 state fold changed its source slot, layer " << layer << '\n';
+        for (std::size_t i = 0; i < slot_elements; ++i) { source_bits[i] = to_half16(source[i]); }
+        if (from_device<std::uint16_t>(half.states->recurrent_slot(index, kSource).data, slot_elements) != source_bits) {
+            std::cerr << tag << " state fold changed its source slot, layer " << layer << '\n';
             return failures + 1;
         }
         const std::size_t conv_elements = static_cast<std::size_t>(kProfile.conv_channels) * 3;
         if (from_device<std::uint16_t>(fp32.states->conv_slot(index, kDestination).data, conv_elements) !=
-            from_device<std::uint16_t>(fp16.states->conv_slot(index, kDestination).data, conv_elements)) {
-            std::cerr << "fp16 state fold's convolution history differs, layer " << layer << '\n';
+            from_device<std::uint16_t>(half.states->conv_slot(index, kDestination).data, conv_elements)) {
+            std::cerr << tag << " state fold's convolution history differs, layer " << layer << '\n';
             return failures + 1;
         }
     }
-    std::cout << "fp16 state record-fold exact=" << (failures == 0) << '\n';
+    std::cout << tag << " state record-fold exact=" << (failures == 0) << '\n';
     return failures;
 }
 
@@ -1086,7 +1091,8 @@ int run_test(int argc, char** argv) {
     failures += run_case({36, 48, 10240}, 8, 2, {8, 3}, 1895U, false, 16, true);
     failures += run_record_fold_rounds<16>();
     failures += run_record_fold_rounds<32>();
-    failures += run_fp16_state_record_fold();
+    failures += run_half_state_record_fold(DType::FP16);
+    failures += run_half_state_record_fold(DType::BF16);
     std::cout << (failures == 0 ? "OK" : "FAIL") << " gdn_replay_fold\n";
     return failures == 0 ? 0 : 1;
 }

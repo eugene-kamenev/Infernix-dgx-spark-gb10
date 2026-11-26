@@ -3,6 +3,7 @@
 #include "ops/linear/mxfp8/mxfp8_format.h"
 #include "ops/linear/mxfp8/mxfp8_shapes.h"
 
+#include <algorithm>
 #include <array>
 #include <stdexcept>
 
@@ -36,6 +37,11 @@ bool uses_pair_block32(const Mxfp8LinearShape& shape, LinearPolicy policy, Linea
            shape.pair_block32 != nullptr && tokens >= shape.pair_min_tokens;
 }
 
+bool uses_mxfp8_a8(const Mxfp8LinearShape& shape, LinearPolicy policy, LinearRoutes routes, std::int32_t tokens) {
+    return has_route(routes, LinearRoutes::Mxfp8A8) && !column_invariant(policy) &&
+           shape.a8 != nullptr && tokens >= shape.a8_min_tokens;
+}
+
 } // namespace
 
 std::size_t mxfp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k, LinearPolicy policy,
@@ -45,14 +51,17 @@ std::size_t mxfp8_linear_workspace_capacity_bytes(std::int32_t n, std::int32_t k
     }
     const Mxfp8LinearShape& shape = resolve_shape(n, k, policy);
     if (column_invariant(policy)) { return 0; }
-    // The query does not see the route flags, so it covers both routes wherever the interval reaches them.
+    // The query does not see the route flags, so it covers all prefill routes wherever the interval reaches them.
     const std::size_t f16 = shape.f16 != nullptr && max_tokens >= shape.f16_min_tokens
                                 ? f16_accumulate_workspace_capacity_bytes(max_tokens, k)
                                 : 0;
     const std::size_t pair = shape.pair_block32 != nullptr && max_tokens >= shape.pair_min_tokens
                                  ? fp8_a8_pair_block32_workspace_capacity_bytes(max_tokens, k)
                                  : 0;
-    return f16 > pair ? f16 : pair;
+    const std::size_t a8 = shape.a8 != nullptr && max_tokens >= shape.a8_min_tokens
+                               ? fp8_a8_block32_workspace_capacity_bytes(max_tokens, k)
+                               : 0;
+    return std::max({f16, pair, a8});
 }
 
 void mxfp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPolicy policy, LinearRoutes routes,
@@ -60,6 +69,14 @@ void mxfp8_dispatch(const Tensor& x, const Weight& weight, Tensor& out, LinearPo
     validate_mxfp8_weight(weight, "mxfp8 linear");
     if (x.ne[1] <= 0) { throw std::invalid_argument("mxfp8 linear: T must be positive"); }
     const Mxfp8LinearShape& shape = resolve_shape(weight.n, weight.k, policy);
+    if (uses_mxfp8_a8(shape, policy, routes, x.ne[1])) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("mxfp8 A8 linear requires caller workspace");
+        }
+        auto scope         = workspace->scope();
+        const auto scratch = allocate_fp8_a8_block32_workspace(*workspace, x.ne[1], weight.k);
+        return shape.a8(x, weight, out, scratch, stream);
+    }
     if (uses_f16(shape, policy, routes, x.ne[1])) {
         if (workspace == nullptr) {
             throw std::invalid_argument("mxfp8 f16-accumulate linear requires caller workspace");

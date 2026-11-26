@@ -385,7 +385,8 @@ void compare_routes(const Shape& shape, const Options& options, bench::L2FlushBu
     };
     static constexpr Case kCases[]{{"exact", ops::LinearRoutes::Exact},
                                    {"f16-accumulate", ops::LinearRoutes::F16Accumulate},
-                                   {"block32-pair", ops::LinearRoutes::Fp8A8PairBlock32}};
+                                   {"block32-pair", ops::LinearRoutes::Fp8A8PairBlock32},
+                                   {"mxfp8-a8", ops::LinearRoutes::Mxfp8A8}};
     const Mxfp8LinearShape* record = mxfp8_record(shape.n, shape.k);
     if (record == nullptr) { throw std::runtime_error("shape is not a registered MXFP8 problem"); }
     const HostWeight host = checkpoint_like(shape.n, shape.k, static_cast<std::uint32_t>(shape.n) * 31U + shape.k);
@@ -404,8 +405,8 @@ void compare_routes(const Shape& shape, const Options& options, bench::L2FlushBu
     CUDA_CHECK(cudaMemcpy(x.p, x_host.data(), x_host.size() * 2, cudaMemcpyHostToDevice));
     DeviceBuffer out(static_cast<std::size_t>(shape.n) * max_t * 2);
 
-    std::printf("\n## routes %s [%d,%d] (admissions: f16-accumulate >= %d, block32-pair >= %d columns)\n",
-                shape.label, shape.n, shape.k, record->f16_min_tokens, record->pair_min_tokens);
+    std::printf("\n## routes %s [%d,%d] (admissions: f16-accumulate >= %d, block32-pair >= %d, mxfp8-a8 >= %d columns)\n",
+                shape.label, shape.n, shape.k, record->f16_min_tokens, record->pair_min_tokens, record->a8_min_tokens);
     for (const int t : options.route_ts) {
         Tensor xt(x.p, DType::BF16, {shape.k, t});
         Tensor ot(out.p, DType::BF16, {shape.n, t});
@@ -417,7 +418,8 @@ void compare_routes(const Shape& shape, const Options& options, bench::L2FlushBu
             // Each case sets exactly one flag, so a route runs at its own admission (the dispatch's
             // f16-over-pair precedence only matters when a caller sets both).
             const bool admitted = c == 0 || (c == 1 && t >= record->f16_min_tokens) ||
-                                  (c == 2 && t >= record->pair_min_tokens);
+                                  (c == 2 && t >= record->pair_min_tokens) ||
+                                  (c == 3 && t >= record->a8_min_tokens);
             const auto timing = time_route(
                 [&](cudaStream_t s) {
                     ops::linear(xt, weight, ot, ops::LinearPolicy::A16Only, workspace, s, kCases[c].routes);

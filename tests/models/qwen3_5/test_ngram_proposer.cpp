@@ -1,6 +1,7 @@
 #include "models/qwen3_5/program/ngram_proposer.h"
 #include "models/qwen3_5/frontend/ngram_sources.h"
 
+#include <algorithm>
 #include <array>
 #include <iostream>
 #include <numeric>
@@ -9,6 +10,7 @@
 using infernix::models::qwen3_5::detail::NgramProposer;
 using infernix::models::qwen3_5::frontend::ToolCallOutputContract;
 using infernix::models::qwen3_5::frontend::ngram_numbered_sources;
+using infernix::models::qwen3_5::frontend::ngram_prompt_entity_sources;
 using infernix::models::qwen3_5::frontend::ngram_tool_schema_sources;
 
 static void require(bool condition, const char* message) {
@@ -273,6 +275,44 @@ int main() {
                                      "\n</parameter>\n</function>\n",
                                  },
                     "tool schema skeletons must match qwen3_8 XML format");
+        }
+        // Verify prompt entity extraction (paths, JSON quoted keys/values, identifiers, dedup, caps)
+        // and short structural match acceptance (matched >= 2, occurrences == 1) for schema_proposer.
+        {
+            const std::array<std::string_view, 2> texts{
+                "Read \"path\": \"data/ledger_1.csv\" via compute_rolling_sum and camelCaseHelper; "
+                "repeat \"path\": \"data/ledger_1.csv\" and visit src/models/qwen4_exp/program/mtp_gating.h.",
+                "Short ok x y _abc \"k\": 42"};
+            const auto entities = ngram_prompt_entity_sources(texts);
+            require(std::find(entities.begin(), entities.end(), "\"path\": \"data/ledger_1.csv\"") != entities.end(),
+                    "entity extractor must capture JSON quoted key/value");
+            require(std::find(entities.begin(), entities.end(), "src/models/qwen4_exp/program/mtp_gating.h") !=
+                        entities.end(),
+                    "entity extractor must capture file path");
+            require(std::find(entities.begin(), entities.end(), "compute_rolling_sum") != entities.end(),
+                    "entity extractor must capture snake_case identifier");
+            require(std::find(entities.begin(), entities.end(), "camelCaseHelper") != entities.end(),
+                    "entity extractor must capture camelCase identifier");
+            require(std::count(entities.begin(), entities.end(), "\"path\": \"data/ledger_1.csv\"") == 1,
+                    "entity extractor must deduplicate repeated snippets");
+
+            std::string huge;
+            for (int i = 0; i < 120; ++i) {
+                huge += "long_identifier_prefix_" + std::to_string(i) + " ";
+            }
+            const std::array<std::string_view, 1> huge_texts{huge};
+            const auto capped = ngram_prompt_entity_sources(huge_texts);
+            require(capped.size() <= 64U, "entity extractor must cap snippet count at 64");
+            std::size_t chars = 0;
+            for (const auto& s : capped) { chars += s.size(); }
+            require(chars <= 4096U, "entity extractor must cap total character budget at 4096");
+
+            NgramProposer schema(256, 1024);
+            schema.ingest(std::vector<int>{500, 501, 502, 503, 504, 505});
+            const auto short_hit = schema.propose(std::vector<int>{500, 501}, 8, 2U);
+            require(short_hit.matched == 2 && short_hit.occurrences == 1U &&
+                        short_hit.tokens == std::vector<int>({502, 503, 504, 505}),
+                    "schema_proposer must support short 2-token structural matches with occurrences == 1");
         }
 
         std::cout << "ngram CPU tests passed; oracle proposals=" << proposals << '\n';

@@ -15,6 +15,7 @@
 #include "ops/linear/mxfp8/mxfp8_shapes.h"
 #include "ops/linear/f16acc/f16acc_mma.cuh"
 #include "ops/linear/fp8/fp8_a8_pair_tma_mma.cuh"
+#include "ops/linear/mxfp8/mxfp8_a8_tma_mma.cuh"
 #include "ops/linear/mxfp8/mxfp8_dispatch.h"
 
 #include <stdexcept>
@@ -62,14 +63,36 @@ void launch_pair_block32(const Tensor& x, const Weight& weight, Tensor& out, Fp8
     fp8_a8_pair_block32_gemm<Geometry, true>(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n},
                                              scratch, stream);
 }
+
+template <class Output>
+void select_a8(const Tensor& x, const Weight& weight, Output output, Fp8A8Block32Workspace scratch,
+               cudaStream_t stream) {
+    if (x.ne[1] <= 256) return mxfp8_a8_gemm<Geometry, Mxfp8A8T64R64G8S3>(x, weight, output, scratch, stream);
+    if (x.ne[1] <= 3072) return mxfp8_a8_gemm<Geometry, Mxfp8A8T128R128G8S3>(x, weight, output, scratch, stream);
+    mxfp8_a8_gemm<Geometry, Mxfp8A8T64R256G8S2>(x, weight, output, scratch, stream);
+}
+
+void launch_a8(const Tensor& x, const Weight& weight, Tensor& out, Fp8A8Block32Workspace scratch,
+               cudaStream_t stream) {
+    select_a8(x, weight, LinearBf16Output{static_cast<__nv_bfloat16*>(out.data), weight.n}, scratch, stream);
+}
 } // namespace
 
-const Mxfp8LinearShape kMxfp8N16384K2560{16384, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN16384};
+const Mxfp8LinearShape kMxfp8N16384K2560{
+    16384, 2560, launch_a16, launch_f16, kMxfp8F16MinTokens, launch_pair_block32, kMxfp8PairMinTokensN16384,
+    launch_a8, kMxfp8A8MinTokensN16384};
 
 void mxfp8_gdn_input_n16384_k2560(const Tensor& x, const Weight& weight, Tensor& qkv, Tensor& z, LinearRoutes routes,
                                   WorkspaceArena* workspace, cudaStream_t stream) {
     const LinearBf16SegmentedOutput<10240, 6144> output{
         {static_cast<__nv_bfloat16*>(qkv.data), static_cast<__nv_bfloat16*>(z.data)}};
+    if (has_route(routes, LinearRoutes::Mxfp8A8) && x.ne[1] >= kMxfp8A8MinTokensN16384) {
+        if (workspace == nullptr) {
+            throw std::invalid_argument("mxfp8 gdn_input_proj: the mxfp8-a8 route requires caller workspace");
+        }
+        auto scope = workspace->scope();
+        return select_a8(x, weight, output, allocate_fp8_a8_block32_workspace(*workspace, x.ne[1], weight.k), stream);
+    }
     if (has_route(routes, LinearRoutes::F16Accumulate) && x.ne[1] >= kMxfp8F16MinTokens) {
         if (workspace == nullptr) {
             throw std::invalid_argument("mxfp8 gdn_input_proj: the f16-accumulate route requires caller workspace");

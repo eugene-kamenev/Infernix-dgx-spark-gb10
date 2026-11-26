@@ -292,9 +292,9 @@ int main() {
         failures += check(q::fast_path_qualified(FastPath::GdnF16Accumulate, iq3s) &&
                               q::fast_path_qualified(FastPath::GdnF16Accumulate, fp8) &&
                               q::fast_path_qualified(FastPath::GdnF16Accumulate, recipe_a) &&
-                              q::fast_path_qualified(FastPath::GdnF16Accumulate, nvfp4) &&
+                              !q::fast_path_qualified(FastPath::GdnF16Accumulate, nvfp4) &&
                               q::fast_path_qualified(FastPath::GdnF16Accumulate, {DenseKernels::Q8, true, kv}),
-                          "gdn-f16-accumulate is registered across Flash-Next configurations");
+                          "gdn-f16-accumulate registration matches qualification across Flash-Next configurations");
     }
     failures += check(exact.gdn_arithmetic == infernix::ops::GdnChunkArithmetic::Exact,
                       "the exact route keeps the GDN prefill exact");
@@ -449,6 +449,28 @@ int main() {
         }
     }
 
+    // mxfp8-a8 serves prefill on MXFP8 dense weights and hybrid NVFP4 dense + MXFP8 attention artifacts
+    // (FastQ-RHT16), sets its prefill route flag only, couples requests, and stays candidate-only until gated.
+    for (const DenseKernels dense : {DenseKernels::Mxfp8, DenseKernels::Nvfp4}) {
+        failures += check(q::fast_path_applies(FastPath::Mxfp8A8, {dense, false, KvCacheStorage::Int8Group64}, options),
+                          "mxfp8-a8 applies to MXFP8 and hybrid NVFP4 configurations");
+    }
+    for (const DenseKernels dense : {DenseKernels::Bf16, DenseKernels::Ggml, DenseKernels::Fp8Row, DenseKernels::Q8}) {
+        failures += check(!q::fast_path_applies(FastPath::Mxfp8A8, {dense, false, KvCacheStorage::Int8Group64}, options),
+                          "mxfp8-a8 does not apply to non-MXFP8/non-NVFP4 dense configurations");
+    }
+    failures += check(!infernix::ops::has_route(exact.prefill_routes, infernix::ops::LinearRoutes::Mxfp8A8),
+                      "the exact route keeps mxfp8-a8 disabled");
+    selection.paths = {FastPath::Mxfp8A8};
+    failures += check(selection.forward().prefill_routes == infernix::ops::LinearRoutes::Mxfp8A8 &&
+                          selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
+                      "mxfp8-a8 sets its route flag for prefill calls only");
+    failures += check(!selection.request_invariant(), "mxfp8-a8 couples a prompt to its call boundaries");
+    for (const DenseKernels dense : {DenseKernels::Mxfp8, DenseKernels::Nvfp4}) {
+        failures += check(!q::fast_path_qualified(FastPath::Mxfp8A8, {dense, false, KvCacheStorage::Int8Group64}),
+                          "mxfp8-a8 stays opt-in until quality-gated");
+    }
+
     // screened-lm-head screens generation's BF16 and 8-bit heads (a GGUF head has no exact rescore), is
     // qualified only where it measured faster (FP4-Local, INT8 KV; the owner's decision, 2026-10-25), couples
     // a request to the rows of its rounds, and changes no Forward flag (the Program decides it per round).
@@ -484,22 +506,28 @@ int main() {
     failures += check(infernix::parse_fast_path("screened-lm-head") == FastPath::ScreenedLmHead,
                       "screened-lm-head parses");
 
-    // fp16-gdn-state applies to every artifact (36 GDN layers each), is qualified on W4Dense (Nvfp4, a4=true),
-    // keeps a request invariant (its roundings follow the request's own calls) and sets no Forward flag (the
-    // Program's state pool carries it).
+    // fp16-gdn-state applies to every artifact (36 GDN layers each), stays an unqualified opt-in
+    // candidate on qwen4_exp configurations (including Nvfp4, a4=true), keeps a request invariant
+    // (its roundings follow the request's own calls), and sets no Forward flag (the Program's state
+    // pool carries it).
     for (const DenseKernels dense : {DenseKernels::Q8, DenseKernels::Bf16, DenseKernels::Fp8Row, DenseKernels::Mxfp8,
                                      DenseKernels::Ggml, DenseKernels::Nvfp4}) {
         failures += check(q::fast_path_applies(FastPath::Fp16GdnState, {dense, false, KvCacheStorage::Int8Group64}, options) &&
                               !q::fast_path_qualified(FastPath::Fp16GdnState, {dense, false, KvCacheStorage::Int8Group64}),
                           "fp16-gdn-state is an unqualified candidate on a4=false artifacts");
     }
-    failures += check(q::fast_path_qualified(FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}),
-                      "fp16-gdn-state is qualified on W4Dense");
+    failures += check(q::fast_path_applies(FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}, options) &&
+                          !q::fast_path_qualified(FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}),
+                      "fp16-gdn-state is an unqualified candidate on W4Dense (a4=true)");
     selection.paths = {FastPath::Fp16GdnState};
     failures += check(selection.request_invariant(), "fp16-gdn-state coupled requests");
     failures += check(selection.forward().dense_routes == infernix::ops::LinearRoutes::Exact,
                       "fp16-gdn-state sets a dense route");
     failures += check(infernix::parse_fast_path("fp16-gdn-state") == FastPath::Fp16GdnState, "fp16-gdn-state parses");
+    failures += check(q::fast_path_applies(FastPath::Bf16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}, options) &&
+                          !q::fast_path_qualified(FastPath::Bf16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}),
+                      "bf16-gdn-state stays an unqualified candidate on W4Dense (a4=true)");
+    failures += check(infernix::parse_fast_path("bf16-gdn-state") == FastPath::Bf16GdnState, "bf16-gdn-state parses");
 
     // block-verification: DFlash2 and MTP chains (the program accepts them through the sparse rule),
     // qualified on W4Dense (Nvfp4, a4=true), and a row's acceptance reads only that row.

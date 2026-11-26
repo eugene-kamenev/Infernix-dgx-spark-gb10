@@ -91,8 +91,9 @@ plan_linear_attention_state_pool(LayoutBuilder& builder, const LinearAttentionSt
     if (spec.conv_dtype != DType::BF16 && spec.conv_dtype != DType::FP32) {
         throw std::invalid_argument("LinearAttentionStatePool conv_dtype must be BF16 or FP32");
     }
-    if (spec.recurrent_dtype != DType::FP16 && spec.recurrent_dtype != DType::FP32) {
-        throw std::invalid_argument("LinearAttentionStatePool recurrent_dtype must be FP16 or FP32");
+    if (spec.recurrent_dtype != DType::FP16 && spec.recurrent_dtype != DType::BF16 &&
+        spec.recurrent_dtype != DType::FP32) {
+        throw std::invalid_argument("LinearAttentionStatePool recurrent_dtype must be FP16, BF16, or FP32");
     }
 
     const Tensor conv_shape(nullptr, spec.conv_dtype,

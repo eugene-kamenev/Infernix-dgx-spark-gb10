@@ -350,6 +350,27 @@ int mxfp8_contract() {
     return failures;
 }
 
+// Single-term block-scaled MXFP8 A8 (LinearRoutes::Mxfp8A8): check all five Flash-Next shapes
+// against the independent FP64 oracle at the admission boundary, tile seams, partial tiles, CUDA Graph
+// replay, and verify A16ColumnInvariant stays exact/column-invariant even when Mxfp8A8 is passed.
+int run_flash_next_mxfp8_a8() {
+    int failures       = 0;
+    std::uint32_t seed = 2901U;
+    for (const auto& [n, k] : kShapes) {
+        std::vector<Invocation> calls;
+        for (int t : {1, 64, 127, 128, 129, 256, 257, 512, 513, 1024, 1025, 2048, 2049, 3072, 3073, 4097}) {
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, false, ops::LinearRoutes::Mxfp8A8});
+        }
+        for (int t : {128, 257, 513}) {
+            calls.push_back({t, CallForm::Policy, ops::LinearPolicy::A16Only, true, ops::LinearRoutes::Mxfp8A8});
+        }
+        calls.push_back({129, CallForm::Policy, ops::LinearPolicy::A16ColumnInvariant, false, ops::LinearRoutes::Mxfp8A8});
+        failures += run_shape("MXFP8_A8 Flash-Next", ActivationCompute::A8, make_mxfp8_weight,
+                              {n, k, seed++, Comparison::Sampled, true, calls});
+    }
+    return failures;
+}
+
 } // namespace
 
 INFERNIX_OP_TEST(linear_mxfp8_a16) {
@@ -358,8 +379,9 @@ INFERNIX_OP_TEST(linear_mxfp8_a16) {
         return 77;
     }
     try {
-        const int failures = mxfp8_contract() + run_flash_next_mxfp8_a16() + mxfp8_a16_column_invariance() +
-                             mxfp8_a16_repeatability() + mxfp8_a16_back_to_back() + mxfp8_a16_dirty_shared();
+        const int failures = mxfp8_contract() + run_flash_next_mxfp8_a16() + run_flash_next_mxfp8_a8() +
+                             mxfp8_a16_column_invariance() + mxfp8_a16_repeatability() +
+                             mxfp8_a16_back_to_back() + mxfp8_a16_dirty_shared();
         std::cout << (failures == 0 ? "OK" : "FAIL") << " MXFP8 A16 Linear\n";
         return failures == 0 ? 0 : 1;
     } catch (const std::exception& error) {

@@ -46,6 +46,17 @@ __device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const __h
     reg[3]                  = hi.y;
 }
 
+__device__ __forceinline__ void load_qk_lane(float (&reg)[kQkPerLane], const __nv_bfloat16* base,
+                                             std::uint32_t dqk_base) {
+    const Bf16x4Pack packed = load_vec<Bf16x4Pack>(base + dqk_base);
+    const float2 lo         = bf16x2_to_float2(packed.pair[0]);
+    const float2 hi         = bf16x2_to_float2(packed.pair[1]);
+    reg[0]                  = lo.x;
+    reg[1]                  = lo.y;
+    reg[2]                  = hi.x;
+    reg[3]                  = hi.y;
+}
+
 __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], float* base,
                                               std::uint32_t dqk_base) {
     store_vec(base + dqk_base, load_vec<float4>(reg));
@@ -56,6 +67,14 @@ __device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], __
     Fp16x4Pack packed;
     packed.pair[0] = __floats2half2_rn(saturate_fp16_state(reg[0]), saturate_fp16_state(reg[1]));
     packed.pair[1] = __floats2half2_rn(saturate_fp16_state(reg[2]), saturate_fp16_state(reg[3]));
+    store_vec(base + dqk_base, packed);
+}
+
+__device__ __forceinline__ void store_qk_lane(const float (&reg)[kQkPerLane], __nv_bfloat16* base,
+                                              std::uint32_t dqk_base) {
+    Bf16x4Pack packed;
+    packed.pair[0] = __floats2bfloat162_rn(reg[0], reg[1]);
+    packed.pair[1] = __floats2bfloat162_rn(reg[2], reg[3]);
     store_vec(base + dqk_base, packed);
 }
 

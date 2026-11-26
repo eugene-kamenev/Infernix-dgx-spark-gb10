@@ -679,4 +679,106 @@ template <class CostFn>
     return local;
 }
 
+inline constexpr std::int32_t kMaxDualChainSideLen = 8;
+
+// Maximum side-branch chain length starting at position (pos + 1) that does not cross a QSA
+// pooled-block boundary: qsa_prepare pools carried/completed blocks only on the main chain, so no
+// side-branch column may hit (p + 1) % ratio == 0.
+[[nodiscard]] inline std::int32_t max_qsa_safe_side_len(std::int32_t pos, std::int32_t ratio,
+                                                        std::int32_t max_side) noexcept {
+    if (max_side <= 0) { return 0; }
+    if (ratio <= 1) { return max_side; }
+    const std::int32_t rem = ((pos + 1) % ratio + ratio) % ratio;
+    return std::clamp<std::int32_t>((ratio - 1) - rem, 0, max_side);
+}
+
+// Builds a two-chain speculative verification tree rooted at column 0:
+// - path 0 (main): 0 -> 1 -> ... -> main_len
+// - path 1 (side): 0 -> (main_len + 1) -> ... -> (main_len + side_len)
+inline void build_dual_chain_tree_row(ops::SpeculativeTreeRow& row, std::int32_t main_len,
+                                      std::int32_t side_len) noexcept {
+    std::memset(&row, 0, sizeof(row));
+    std::fill(std::begin(row.parent), std::end(row.parent), static_cast<std::int8_t>(-1));
+    std::fill(std::begin(row.first_child), std::end(row.first_child), static_cast<std::int8_t>(-1));
+    std::fill(std::begin(row.next_sibling), std::end(row.next_sibling), static_cast<std::int8_t>(-1));
+    const std::int32_t main_depth =
+        std::clamp<std::int32_t>(main_len, 0, ops::kSpeculativeTreeMaxPathLength - 1);
+    const std::int32_t sides = std::clamp<std::int32_t>(
+        side_len, 0,
+        std::min<std::int32_t>({kMaxDualChainSideLen, main_depth, ops::kSpeculativeTreeMaxPathLength - 1,
+                                ops::kSpeculativeTreeMaxNodes - 1 - main_depth}));
+    row.main_depth = main_depth;
+    row.tree       = sides > 0 ? 1 : 0;
+    row.transport  = 0;
+    row.sampled    = 0;
+    for (std::int32_t c = 1; c <= main_depth; ++c) {
+        row.parent[c]          = static_cast<std::int8_t>(c - 1);
+        row.depth[c]           = static_cast<std::int8_t>(c);
+        row.first_child[c - 1] = static_cast<std::int8_t>(c);
+        row.sibling_index[c]   = 0;
+        row.path_columns[0][c] = static_cast<std::int8_t>(c);
+    }
+    row.path_length[0] = static_cast<std::int8_t>(main_depth + 1);
+    row.owned_from[0]  = 0;
+    row.nodes          = main_depth + 1 + sides;
+    row.paths          = sides > 0 ? 2 : 1;
+    if (sides > 0) {
+        const std::int32_t side_root = main_depth + 1;
+        row.parent[side_root]        = 0;
+        row.depth[side_root]         = 1;
+        if (main_depth >= 1) {
+            row.next_sibling[1]          = static_cast<std::int8_t>(side_root);
+            row.sibling_index[side_root] = 1;
+        } else {
+            row.first_child[0]           = static_cast<std::int8_t>(side_root);
+            row.sibling_index[side_root] = 0;
+        }
+        row.path_columns[1][0] = 0;
+        row.path_columns[1][1] = static_cast<std::int8_t>(side_root);
+        for (std::int32_t k = 1; k < sides; ++k) {
+            const std::int32_t col   = side_root + k;
+            row.parent[col]          = static_cast<std::int8_t>(col - 1);
+            row.depth[col]           = static_cast<std::int8_t>(1 + k);
+            row.first_child[col - 1] = static_cast<std::int8_t>(col);
+            row.sibling_index[col]   = 0;
+            row.path_columns[1][1 + k] = static_cast<std::int8_t>(col);
+        }
+        row.path_length[1] = static_cast<std::int8_t>(1 + sides);
+        row.owned_from[1]  = 1;
+    }
+}
+
+// R1 MoE unique-expert-union cost gate: admits grafting a structural/SAM side branch only when its
+// expected committed tokens improve net expected tokens per unit verification time T(W) under
+// GB10's memory-bandwidth-bound MoE decode scaling.
+[[nodiscard]] inline bool should_graft_side_branch(std::int32_t main_len, std::int32_t side_len,
+                                                   double side_accept_prob,
+                                                   double main_first_accept_prob,
+                                                   std::int32_t extra_experts_budget) noexcept {
+    if (main_len <= 0 || side_len <= 0 || side_accept_prob <= 0.0) { return false; }
+    const double p_main = std::clamp(main_first_accept_prob, 0.0, 0.99);
+    const double p_side = std::clamp(side_accept_prob, 0.0, 0.99);
+    double expected_main = 1.0;
+    {
+        double reach = p_main;
+        for (std::int32_t j = 0; j < main_len; ++j) {
+            expected_main += reach;
+            reach *= 0.65;
+        }
+    }
+    const double miss_prob = std::clamp(1.0 - p_main, 0.05, 1.0);
+    double expected_side   = 0.0;
+    {
+        double reach = miss_prob;
+        for (std::int32_t k = 0; k < side_len; ++k) {
+            reach *= p_side;
+            expected_side += reach;
+        }
+    }
+    const double cost_main = 1.0 + 0.035 * static_cast<double>(main_len);
+    const double cost_tree = cost_main + 0.015 * static_cast<double>(side_len) +
+                             0.008 * static_cast<double>(std::max<std::int32_t>(0, extra_experts_budget));
+    return (expected_main + expected_side) / cost_tree > expected_main / cost_main;
+}
+
 } // namespace infernix::models::qwen4_exp

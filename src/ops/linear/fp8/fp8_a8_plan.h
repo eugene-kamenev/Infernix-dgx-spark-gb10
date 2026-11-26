@@ -155,5 +155,38 @@ inline std::size_t fp8_a8_pair_block32_workspace_capacity_bytes(std::int32_t tok
 void launch_fp8_a8_pair_block32_quantize(const Tensor& x, const Weight& weight,
                                          Fp8A8PairBlock32Workspace workspace, cudaStream_t stream);
 
+// Single-term MXFP8 activation quantization (LinearRoutes::Mxfp8A8): one E4M3 plane [T][K] and
+// one UE8M0 scale word plane [K / 128][fp8_a8_pair_block32_scale_stride(T)] (four per-32 scales).
+struct Fp8A8Block32Workspace {
+    std::uint8_t* codes         = nullptr;
+    std::uint32_t* block_scales = nullptr;
+};
+
+template <class Arena>
+Fp8A8Block32Workspace allocate_fp8_a8_block32_workspace(Arena& arena, std::int32_t tokens,
+                                                        std::int32_t input_rows) {
+    if (input_rows <= 0 || (input_rows % kFp8A8PairBlock32K) != 0) {
+        throw std::invalid_argument("fp8 A8 block32 workspace: invalid K");
+    }
+    const std::size_t code_bytes = fp8_a8_checked_bytes(tokens, static_cast<std::size_t>(input_rows));
+    const std::size_t scale_bytes = fp8_a8_checked_bytes(
+        fp8_a8_pair_block32_scale_stride(tokens),
+        static_cast<std::size_t>(input_rows / kFp8A8PairBlock32K) * sizeof(std::uint32_t));
+    const DeviceSpan codes  = arena.alloc_bytes(code_bytes, 256);
+    const DeviceSpan scales = arena.alloc_bytes(scale_bytes, 256);
+    return {static_cast<std::uint8_t*>(codes.data), static_cast<std::uint32_t*>(scales.data)};
+}
+
+inline std::size_t fp8_a8_block32_workspace_capacity_bytes(std::int32_t tokens,
+                                                           std::int32_t input_rows) {
+    WorkspaceLayoutBuilder layout;
+    (void)allocate_fp8_a8_block32_workspace(layout, tokens, input_rows);
+    return layout.peak_bytes(1);
+}
+
+// Writes the single E4M3 activation term and its block-32 UE8M0 scales for x (K = weight.k).
+void launch_fp8_a8_block32_quantize(const Tensor& x, const Weight& weight,
+                                    Fp8A8Block32Workspace workspace, cudaStream_t stream);
+
 
 } // namespace infernix::ops::detail

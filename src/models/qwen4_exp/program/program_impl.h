@@ -60,6 +60,7 @@
 #include <bit>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
 #include <cstdio>
 #include <cerrno>
 #include <cmath>
@@ -77,6 +78,155 @@
 
 namespace infernix::models::qwen4_exp {
 namespace detail {
+
+// Asynchronous Grace CPU speculative prefetch worker that overlaps read-only structural SAM
+// lookups on L3-resident schema_proposer with GPU 48-layer verify() execution. Strictly read-only
+// during GPU verify; wait_idle() is called before mutating proposers in commit_verified() or release().
+class DraftPrefetchWorker {
+public:
+    static constexpr std::size_t kSuffixKeyLen = 16U;
+    static constexpr std::size_t kMaxEntries   = 8U;
+
+    DraftPrefetchWorker() = default;
+    ~DraftPrefetchWorker() noexcept { shutdown(); }
+
+    DraftPrefetchWorker(const DraftPrefetchWorker&)            = delete;
+    DraftPrefetchWorker& operator=(const DraftPrefetchWorker&) = delete;
+
+    void submit(std::uint32_t lane, const qwen3_5::detail::NgramProposer* proposer,
+                std::span<const std::int32_t> tail, std::span<const std::int32_t> predicted,
+                std::uint32_t ngram_limit, std::uint32_t min_match) {
+        if (proposer == nullptr || tail.size() < min_match) { return; }
+        std::unique_lock<std::mutex> lock(mu_);
+        if (stop_ || busy_) { return; }
+        if (!worker_.joinable()) {
+            worker_ = std::thread([this] { run(); });
+        }
+        job_lane_        = lane;
+        job_proposer_    = proposer;
+        job_limit_       = ngram_limit;
+        job_min_match_   = min_match;
+        const std::size_t tail_keep = std::min<std::size_t>(tail.size(), 64U);
+        job_tail_.assign(tail.end() - static_cast<std::ptrdiff_t>(tail_keep), tail.end());
+        const std::size_t pred_keep = std::min<std::size_t>(predicted.size(), 6U);
+        job_predicted_.assign(predicted.begin(), predicted.begin() + static_cast<std::ptrdiff_t>(pred_keep));
+        entry_count_ = 0U;
+        busy_        = true;
+        cv_.notify_one();
+    }
+
+    void wait_idle() noexcept {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return !busy_; });
+    }
+
+    bool consume(std::uint32_t lane, std::span<const std::int32_t> actual_tail, std::uint32_t ngram_limit,
+                 qwen3_5::NgramMatch& out) noexcept {
+        std::unique_lock<std::mutex> lock(mu_);
+        cv_.wait(lock, [this] { return !busy_; });
+        if (lane != entry_lane_ || entry_count_ == 0U || actual_tail.size() < kSuffixKeyLen) {
+            return false;
+        }
+        const auto key_span = actual_tail.last(kSuffixKeyLen);
+        for (std::size_t i = 0; i < entry_count_; ++i) {
+            if (entries_[i].limit == ngram_limit &&
+                std::equal(entries_[i].key.begin(), entries_[i].key.end(), key_span.begin())) {
+                out = std::move(entries_[i].match);
+                entry_count_ = 0U;
+                return true;
+            }
+        }
+        return false;
+    }
+
+    void shutdown() noexcept {
+        {
+            std::lock_guard<std::mutex> lock(mu_);
+            stop_ = true;
+        }
+        cv_.notify_all();
+        if (worker_.joinable()) { worker_.join(); }
+    }
+
+private:
+    struct Entry {
+        std::array<std::int32_t, kSuffixKeyLen> key{};
+        std::uint32_t limit = 0U;
+        qwen3_5::NgramMatch match;
+    };
+
+    void run() noexcept {
+        std::vector<std::int32_t> probe;
+        probe.reserve(128U);
+        while (true) {
+            std::unique_lock<std::mutex> lock(mu_);
+            cv_.wait(lock, [this] { return stop_ || busy_; });
+            if (stop_) { break; }
+            const qwen3_5::detail::NgramProposer* proposer = job_proposer_;
+            const std::uint32_t lane                       = job_lane_;
+            const std::uint32_t limit                      = job_limit_;
+            const std::uint32_t min_match                  = job_min_match_;
+            probe.assign(job_tail_.begin(), job_tail_.end());
+            const std::size_t base_len = probe.size();
+            const std::size_t pred_n   = job_predicted_.size();
+            for (std::size_t i = 0; i < pred_n; ++i) { probe.push_back(job_predicted_[i]); }
+            lock.unlock();
+
+            std::array<Entry, kMaxEntries> local{};
+            std::size_t count = 0U;
+            try {
+                for (std::size_t k = 0; k <= pred_n && count + 1U < kMaxEntries; ++k) {
+                    const auto span = std::span<const std::int32_t>(probe.data(), base_len + k);
+                    if (span.size() < kSuffixKeyLen) { continue; }
+                    auto match = proposer->propose(span, limit, min_match);
+                    if (match.tokens.size() > 1U) {
+                        const std::int32_t predicted_bonus = match.tokens.front();
+                        std::array<std::int32_t, kSuffixKeyLen> next_key{};
+                        for (std::size_t j = 0; j + 1U < kSuffixKeyLen; ++j) {
+                            next_key[j] = span[span.size() - (kSuffixKeyLen - 1U) + j];
+                        }
+                        next_key[kSuffixKeyLen - 1U] = predicted_bonus;
+                        qwen3_5::NgramMatch tail_match = match;
+                        tail_match.tokens.erase(tail_match.tokens.begin());
+                        ++tail_match.matched;
+                        local[count++] = {.key = next_key, .limit = limit, .match = std::move(tail_match)};
+                    }
+                    if (!match.tokens.empty() && count < kMaxEntries) {
+                        std::array<std::int32_t, kSuffixKeyLen> key{};
+                        const auto ks = span.last(kSuffixKeyLen);
+                        std::copy(ks.begin(), ks.end(), key.begin());
+                        local[count++] = {.key = key, .limit = limit, .match = std::move(match)};
+                    }
+                }
+            } catch (...) {
+                count = 0U;
+            }
+
+            lock.lock();
+            entry_lane_  = lane;
+            entry_count_ = count;
+            for (std::size_t i = 0; i < count; ++i) { entries_[i] = std::move(local[i]); }
+            busy_ = false;
+            lock.unlock();
+            cv_.notify_all();
+        }
+    }
+
+    std::mutex mu_;
+    std::condition_variable cv_;
+    std::thread worker_;
+    bool stop_ = false;
+    bool busy_ = false;
+    std::uint32_t job_lane_ = 0U;
+    const qwen3_5::detail::NgramProposer* job_proposer_ = nullptr;
+    std::uint32_t job_limit_     = 0U;
+    std::uint32_t job_min_match_ = 2U;
+    std::vector<std::int32_t> job_tail_;
+    std::vector<std::int32_t> job_predicted_;
+    std::uint32_t entry_lane_ = 0U;
+    std::size_t entry_count_  = 0U;
+    std::array<Entry, kMaxEntries> entries_{};
+};
 
 // One of the draft-length policy constants, which were all measured on an RTX 5090 (design 11.3,
 // 19.2, 19.3.5), where a wider verification round was expensive: a one-row round of K = 3, 4, 5
@@ -492,6 +642,7 @@ public:
         NgramVolume::Counters ngram; // this request's n-gram row traffic
         GateTraffic gate;            // its verification rounds' rows read behind the n-gram gate
         std::unique_ptr<qwen3_5::detail::NgramProposer> proposer; // copy proposals over history
+        std::unique_ptr<qwen3_5::detail::NgramProposer> schema_proposer; // L3-resident schema & entity SAM
         qwen3_5::detail::DualGenSuffixAutomaton::Cursor cross_cursor{};
         SpeculativeStats speculative;
         // MTP drafter (design 11.2; rule MR1 of 19.3.1): its KV cells [0, mtp_cells) are final. At
@@ -589,8 +740,7 @@ public:
                                                                     .value_head_dim = dim(c.gdn.value_head_dim),
                                                                     .key_head_dim   = dim(c.gdn.key_head_dim),
                                                                     .slot_count     = lanes,
-                                                                    .recurrent_dtype = o.fp16_gdn_state ? DType::FP16
-                                                                                                        : DType::FP32,
+                                                                    .recurrent_dtype = o.gdn_recurrent_dtype(),
                                                                 });
         d.gdn_bytes = state_builder.finish(256);
         d.ple       = width * c.ple.conv_span() * lanes * 2;
@@ -939,6 +1089,9 @@ public:
             if (ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::Fp8A8PairBlock32)) {
                 bytes += ops::linear_fp8_a8_pair_block32_workspace_bytes(dim(k), std::max(columns, lanes * W));
             }
+            if (ops::has_route(o.fast_paths.prefill_routes, ops::LinearRoutes::Mxfp8A8)) {
+                bytes += ops::linear_mxfp8_a8_workspace_bytes(dim(k), std::max(columns, lanes * W));
+            }
         }
         if (W > 1) {
             std::size_t accept =
@@ -948,8 +1101,7 @@ public:
                                               d.token_domain, ops::SpeculativeAcceptExecutionEnvelope{}, 1, W - 1, 1,
                                               lanes));
             }
-            if (o.univer_trees && W > 2 && ((o.sampled_mtp_drafts && d.mtp) || d.dflash2) &&
-                W <= ops::kSpeculativeTreeMaxNodes) {
+            if (o.univer_trees && W > 2 && (d.mtp || d.dflash2) && W <= ops::kSpeculativeTreeMaxNodes) {
                 accept = std::max(
                     accept, ops::speculative_accept_sparse_tree_workspace_capacity_bytes(d.token_domain, W, 1, lanes));
             }
@@ -1934,6 +2086,11 @@ public:
                     lane.proposer->ingest(lane.history);
                     for (const auto& src : data.ngram_sources) { lane.proposer->ingest(src); }
                 }
+                if (!data.structural_sources.empty()) {
+                    lane.schema_proposer = std::make_unique<qwen3_5::detail::NgramProposer>(8192U, 4096U);
+                    lane.schema_proposer->set_boundaries(data.ngram_boundaries);
+                    for (const auto& src : data.structural_sources) { lane.schema_proposer->ingest(src); }
+                }
                 if (cross_request_proposer_ && lane.history.size() >= 4U) {
                     try {
                         const std::size_t keep = std::min(lane.history.size(), cross_request_proposer_->capacity());
@@ -2179,6 +2336,11 @@ public:
             lane.proposer->set_boundaries(prompt.ngram_boundaries);
             lane.proposer->ingest(lane.history);
             for (const auto& src : prompt.ngram_sources) { lane.proposer->ingest(src); }
+            if (!prompt.structural_sources.empty()) {
+                lane.schema_proposer = std::make_unique<qwen3_5::detail::NgramProposer>(8192U, 4096U);
+                lane.schema_proposer->set_boundaries(prompt.ngram_boundaries);
+                for (const auto& src : prompt.structural_sources) { lane.schema_proposer->ingest(src); }
+            }
             if (cross_request_proposer_ && lane.history.size() >= 4U) {
                 try {
                     const std::size_t keep = std::min(lane.history.size(), cross_request_proposer_->capacity());
@@ -2738,9 +2900,10 @@ public:
             ngram_alt_token_[b]          = -1;
             ngram_alt_q0_[b]             = 1.0F;
             ngram_proposal_[b].clear();
-            ngram_proposal_bucket_[b]    = -1;
-            ngram_proposal_alt_token_[b] = -1;
-            ngram_proposal_alt_q0_[b]    = 1.0F;
+            ngram_proposal_bucket_[b]     = -1;
+            ngram_proposal_structural_[b] = false;
+            ngram_proposal_alt_token_[b]  = -1;
+            ngram_proposal_alt_q0_[b]     = 1.0F;
             const std::uint32_t remaining =
                 static_cast<std::size_t>(b) < budgets.size() ? budgets[b].generated_tokens_remaining : 0U;
             if (remaining < 2) { continue; }
@@ -2781,6 +2944,12 @@ public:
                     }
                     match = select_ngram_proposal(std::move(match), std::move(cross));
                 }
+                qwen3_5::NgramMatch schema_match;
+                if (lane.schema_proposer) {
+                    if (!draft_prefetch_.consume(lanes[b], tail, ngram_limit, schema_match)) {
+                        schema_match = lane.schema_proposer->propose(tail, ngram_limit, 3U);
+                    }
+                }
                 const int bucket = ngram_confidence_bucket(match.matched, match.occurrences, match.distance, false);
                 if (!match.tokens.empty() && options_.auto_draft_length) {
                     const std::int32_t opt = best_copy_len_for(
@@ -2797,6 +2966,10 @@ public:
                                              lane.ngram_accept[static_cast<std::size_t>(bucket)],
                                              lane.mtp_accept, chain_compare, batch, dflash2_, false);
                 }
+                if (!take && extents[b] == 0 && schema_match.matched >= 3U && schema_match.tokens.size() >= 2U) {
+                    match = std::move(schema_match);
+                    take  = true;
+                }
                 if (take) {
                     drafts_[b]          = std::move(match.tokens);
                     from_ngram_[b]      = true;
@@ -2804,11 +2977,26 @@ public:
                     ngram_alt_token_[b] = match.alt_token;
                     ngram_alt_q0_[b]    = ngram_branch_q0(match.occurrences, match.alt_occurrences);
                     extents[b]          = static_cast<std::int32_t>(drafts_[b].size());
-                } else if (!match.tokens.empty()) {
-                    ngram_proposal_[b]           = std::move(match.tokens);
-                    ngram_proposal_bucket_[b]    = bucket;
-                    ngram_proposal_alt_token_[b] = match.alt_token;
-                    ngram_proposal_alt_q0_[b]    = ngram_branch_q0(match.occurrences, match.alt_occurrences);
+                } else if (!schema_match.tokens.empty() || !match.tokens.empty()) {
+                    const bool use_schema =
+                        schema_match.tokens.size() > match.tokens.size() ||
+                        (schema_match.tokens.size() == match.tokens.size() &&
+                         schema_match.matched >= match.matched);
+                    if (use_schema && !schema_match.tokens.empty()) {
+                        ngram_proposal_structural_[b] = true;
+                        ngram_proposal_alt_token_[b]  = schema_match.alt_token;
+                        ngram_proposal_alt_q0_[b] =
+                            ngram_branch_q0(schema_match.occurrences, schema_match.alt_occurrences);
+                        ngram_proposal_bucket_[b] = ngram_confidence_bucket(
+                            schema_match.matched, schema_match.occurrences, schema_match.distance, false);
+                        ngram_proposal_[b] = std::move(schema_match.tokens);
+                    } else if (!match.tokens.empty()) {
+                        ngram_proposal_[b]            = std::move(match.tokens);
+                        ngram_proposal_bucket_[b]     = bucket;
+                        ngram_proposal_structural_[b] = false;
+                        ngram_proposal_alt_token_[b]  = match.alt_token;
+                        ngram_proposal_alt_q0_[b]     = ngram_branch_q0(match.occurrences, match.alt_occurrences);
+                    }
                 }
             }
             width = std::max(width, 1 + extents[b]);
@@ -2840,7 +3028,7 @@ public:
                 if (from_ngram_[b] || extents[b] <= 0) { continue; }
                 const std::int32_t chain_ext = std::min(extents[b], mtp_confident_[b]);
                 const auto copies            = static_cast<std::int32_t>(ngram_proposal_[b].size());
-                if (copies > chain_ext &&
+                if (!ngram_proposal_structural_[b] && copies > chain_ext &&
                     copy_beats_neural(
                         copies,
                         lanes_[lanes[b]].ngram_accept[static_cast<std::size_t>(ngram_proposal_bucket_[b])],
@@ -4256,7 +4444,9 @@ private:
         lane.cross_cursor = {};
         lane.rope = {};
         if (lane.vision) { vision_release(lane); }
+        draft_prefetch_.wait_idle();
         lane.proposer.reset();
+        lane.schema_proposer.reset();
         lane.readout.clear();
         lane.constraint.reset();
         lane.prompt.reset();
@@ -4410,10 +4600,23 @@ private:
                 for (std::int32_t j = f; j < t; ++j) {
                     window_.clear();
                     if (j >= side && j < side + sc) {
-                        for (std::int32_t q = p - (context - 1); q <= p; ++q) {
-                            window_.push_back(q < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(q)]);
+                        if (row_is_dual_chain_[b]) {
+                            const std::int32_t k_idx = j - side;
+                            for (std::int32_t q = context; q >= 0; --q) {
+                                if (q <= k_idx) {
+                                    window_.push_back(tree_side_tokens_[b][static_cast<std::size_t>(k_idx - q)]);
+                                } else {
+                                    const std::int32_t hist_pos = p - (q - (k_idx + 1));
+                                    window_.push_back(hist_pos < 0 ? c_.eos_token_id
+                                                                   : lane.history[static_cast<std::size_t>(hist_pos)]);
+                                }
+                            }
+                        } else {
+                            for (std::int32_t q = p - (context - 1); q <= p; ++q) {
+                                window_.push_back(q < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(q)]);
+                            }
+                            window_.push_back(tree_side_tokens_[b][static_cast<std::size_t>(j - side)]);
                         }
-                        window_.push_back(tree_side_tokens_[b][static_cast<std::size_t>(j - side)]);
                     } else if (j >= side + sc) {
                         for (std::int32_t q = p - context; q <= p; ++q) {
                             window_.push_back(q < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(q)]);
@@ -4624,10 +4827,22 @@ private:
             for (std::int32_t j = 0; j < W; ++j) {
                 std::int32_t* col_dst = dst + static_cast<std::size_t>(b * W + j) * n_ctx;
                 if (row_tree && j >= n + 1 && j < nodes) {
-                    col_dst[0] = tree_side_tokens_[b][static_cast<std::size_t>(j - (n + 1))];
-                    for (std::int32_t s = 1; s < n_ctx; ++s) {
-                        const std::int32_t at = p - (s - 1);
-                        col_dst[s] = at < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(at)];
+                    if (row_is_dual_chain_[b]) {
+                        const std::int32_t k_idx = j - (n + 1);
+                        for (std::int32_t s = 0; s < n_ctx; ++s) {
+                            if (s <= k_idx) {
+                                col_dst[s] = tree_side_tokens_[b][static_cast<std::size_t>(k_idx - s)];
+                            } else {
+                                const std::int32_t at = p - (s - (k_idx + 1));
+                                col_dst[s] = at < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(at)];
+                            }
+                        }
+                    } else {
+                        col_dst[0] = tree_side_tokens_[b][static_cast<std::size_t>(j - (n + 1))];
+                        for (std::int32_t s = 1; s < n_ctx; ++s) {
+                            const std::int32_t at = p - (s - 1);
+                            col_dst[s] = at < 0 ? c_.eos_token_id : lane.history[static_cast<std::size_t>(at)];
+                        }
                     }
                 } else if (row_tree && j >= nodes) {
                     std::memcpy(col_dst, dst + static_cast<std::size_t>(b * W) * n_ctx,
@@ -5788,6 +6003,7 @@ private:
         const cudaStream_t s = device_.stream;
         const auto batch     = static_cast<std::int32_t>(lanes.size());
         row_is_tree_.fill(false);
+        row_is_dual_chain_.fill(false);
         tree_side_count_.fill(0);
         const bool dflash_sampled_preview =
             dflash_round_ && sampled_dflash_drafts_ &&
@@ -5804,23 +6020,73 @@ private:
         }
         const std::int32_t model_limit =
             std::min(dim(c_.context_ceiling()), static_cast<std::int32_t>(options_.max_context));
-        if (options_.univer_trees && batch == 1 && !c_.lossless && sampled_preview && !any_constrained) {
+        if (options_.univer_trees && batch == 1 && !c_.lossless && !any_constrained &&
+            (sampled_preview || (mtp_ && !dflash_round_))) {
             constexpr std::int32_t C = ops::kSparseSpeculativeCandidates;
             for (std::int32_t b = 0; b < batch; ++b) {
                 const Lane& lane = lanes_[lanes[b]];
                 const auto n     = static_cast<std::int32_t>(drafts_[b].size());
-                if (stitched_ngram_[b] || !(lane.sampling.temperature > 0.0F) || n < 1 ||
-                    n > ops::kSpeculativeTreeMaxPathLength - 1) {
-                    continue;
-                }
+                if (stitched_ngram_[b] || n < 1 || n > ops::kSpeculativeTreeMaxPathLength - 1) { continue; }
                 const std::int32_t allocated_kv =
                     static_cast<std::int32_t>(lane.prefix.page_base + lane.pages.size()) * kPagedKVPageSize;
                 const std::int32_t lane_limit =
                     std::min({model_limit, static_cast<std::int32_t>(lane.extent), allocated_kv});
                 const std::int32_t avail_sides =
-                    std::min({kMaxRootForkSides, std::min(max_width_, ops::kSpeculativeTreeMaxNodes) - (n + 1),
-                              lane_limit - (positions[b] + n + 1)});
+                    std::min(std::min(max_width_, ops::kSpeculativeTreeMaxNodes) - (n + 1),
+                             lane_limit - (positions[b] + n + 1));
                 if (avail_sides <= 0) { continue; }
+                const bool row_sampled = lane.sampling.temperature > 0.0F;
+                const std::int32_t* cands = nullptr;
+                const float* qs           = nullptr;
+                if (row_sampled && sampled_preview && !from_ngram_[b]) {
+                    if (dflash_sampled_preview) {
+                        const std::size_t off = static_cast<std::size_t>(b) * dflash_k_ * C;
+                        cands                 = dflash_host(dflash_io_.candidates + off);
+                        qs                    = reinterpret_cast<const float*>(dflash_host(dflash_io_.q + off));
+                    } else {
+                        const std::int32_t nb = mtp_draft_row_[static_cast<std::size_t>(b)];
+                        if (nb >= 0) {
+                            const std::size_t off = static_cast<std::size_t>(nb) * C;
+                            cands                 = mtp_host(mtp_io_.draft_candidates + off);
+                            qs                    = reinterpret_cast<const float*>(mtp_host(mtp_io_.draft_q + off));
+                        }
+                    }
+                }
+                if (!from_ngram_[b] && ngram_proposal_structural_[b] && !ngram_proposal_[b].empty() &&
+                    ngram_proposal_[b].front() != drafts_[b][0]) {
+                    bool side_supported = !row_sampled;
+                    if (row_sampled && sampled_preview && cands != nullptr && qs != nullptr) {
+                        const std::int32_t side0 = ngram_proposal_[b].front();
+                        for (std::int32_t ci = 0; ci < C; ++ci) {
+                            if (cands[ci] == side0 && qs[ci] > 0.0F) {
+                                side_supported = true;
+                                break;
+                            }
+                        }
+                    }
+                    const std::int32_t safe_len = max_qsa_safe_side_len(
+                        positions[b], r_,
+                        std::min<std::int32_t>({avail_sides, n, kMaxDualChainSideLen,
+                                                ops::kSpeculativeTreeMaxPathLength - 1,
+                                                static_cast<std::int32_t>(ngram_proposal_[b].size())}));
+                    double side_prob = 0.85;
+                    if (row_sampled) { side_prob *= 0.85; }
+                    const double main_first_prob = lane.mtp_accept[0] > 0.0 ? lane.mtp_accept[0] : 0.70;
+                    if (side_supported && safe_len >= (n > 1 ? 2 : 1) &&
+                        should_graft_side_branch(n, safe_len, side_prob, main_first_prob, safe_len)) {
+                        row_is_tree_[b]       = true;
+                        row_is_dual_chain_[b] = true;
+                        tree_side_count_[b]   = safe_len;
+                        for (std::int32_t s_i = 0; s_i < safe_len; ++s_i) {
+                            tree_side_tokens_[b][static_cast<std::size_t>(s_i)] =
+                                ngram_proposal_[b][static_cast<std::size_t>(s_i)];
+                        }
+                        width = std::max(width, n + 1 + safe_len);
+                        continue;
+                    }
+                }
+                if (!sampled_preview || !row_sampled) { continue; }
+                const std::int32_t avail_root_fork = std::min(avail_sides, kMaxRootForkSides);
                 if (from_ngram_[b]) {
                     if ((r_ <= 1 || (positions[b] % r_) != (r_ - 2)) &&
                         ngram_alt_token_[b] >= 0 && ngram_alt_token_[b] != drafts_[b][0]) {
@@ -5831,29 +6097,18 @@ private:
                     }
                     continue;
                 }
-                const std::int32_t* cands = nullptr;
-                const float* qs           = nullptr;
-                if (dflash_sampled_preview) {
-                    const std::size_t off = static_cast<std::size_t>(b) * dflash_k_ * C;
-                    cands                 = dflash_host(dflash_io_.candidates + off);
-                    qs                    = reinterpret_cast<const float*>(dflash_host(dflash_io_.q + off));
-                } else {
-                    const std::int32_t nb = mtp_draft_row_[static_cast<std::size_t>(b)];
-                    if (nb >= 0) {
-                        const std::size_t off = static_cast<std::size_t>(nb) * C;
-                        cands                 = mtp_host(mtp_io_.draft_candidates + off);
-                        qs                    = reinterpret_cast<const float*>(mtp_host(mtp_io_.draft_q + off));
-                    }
-                }
                 if (cands == nullptr || qs == nullptr) { continue; }
                 const auto dec = choose_root_fork_sides(
                     drafts_[b][0], std::span<const std::int32_t>(cands, C), std::span<const float>(qs, C),
-                    positions[b], r_, lane.sampling.seed, avail_sides);
+                    positions[b], r_, lane.sampling.seed, avail_root_fork);
                 if (dec.count > 0) {
-                    row_is_tree_[b]      = true;
-                    tree_side_count_[b]  = dec.count;
-                    tree_side_tokens_[b] = dec.side_tokens;
-                    width                = std::max(width, n + 1 + dec.count);
+                    row_is_tree_[b]     = true;
+                    tree_side_count_[b] = dec.count;
+                    for (std::int32_t k = 0; k < dec.count; ++k) {
+                        tree_side_tokens_[b][static_cast<std::size_t>(k)] =
+                            dec.side_tokens[static_cast<std::size_t>(k)];
+                    }
+                    width = std::max(width, n + 1 + dec.count);
                 }
             }
         }
@@ -5873,15 +6128,17 @@ private:
         }
         if (W < 3 || W > ops::kSpeculativeTreeMaxNodes) {
             row_is_tree_.fill(false);
+            row_is_dual_chain_.fill(false);
             tree_side_count_.fill(0);
         } else {
             for (std::int32_t b = 0; b < batch; ++b) {
                 if (row_is_tree_[b] &&
                     static_cast<std::int32_t>(drafts_[b].size()) + 1 + tree_side_count_[b] > W) {
-                    const std::int32_t fit = W - (static_cast<std::int32_t>(drafts_[b].size()) + 1);
+                    const std::int32_t fit = W - (static_cast<std::size_t>(drafts_[b].size()) + 1);
                     if (fit <= 0) {
-                        row_is_tree_[b]     = false;
-                        tree_side_count_[b] = 0;
+                        row_is_tree_[b]       = false;
+                        row_is_dual_chain_[b] = false;
+                        tree_side_count_[b]   = 0;
                     } else {
                         tree_side_count_[b] = fit;
                     }
@@ -5910,7 +6167,11 @@ private:
             host_lanes_[b]       = static_cast<std::int32_t>(lanes[b]);
             if (tree_round) {
                 auto* tree_rows_host = reinterpret_cast<ops::SpeculativeTreeRow*>(spec_host(spec_layout_.tree_rows));
-                build_root_fork_tree_row(tree_rows_host[b], n, row_is_tree_[b] ? tree_side_count_[b] : 0);
+                if (row_is_dual_chain_[b]) {
+                    build_dual_chain_tree_row(tree_rows_host[b], n, row_is_tree_[b] ? tree_side_count_[b] : 0);
+                } else {
+                    build_root_fork_tree_row(tree_rows_host[b], n, row_is_tree_[b] ? tree_side_count_[b] : 0);
+                }
                 const std::int32_t nodes = tree_rows_host[b].nodes;
                 ids[b * W + 0]           = lane.history.back();
                 for (std::int32_t j = 1; j <= n; ++j) {
@@ -5995,6 +6256,15 @@ private:
             }
             replay(*tail, [&] { verify_graph_body(batch, W, screened, tree_round, ForwardPart::Tail); });
         }
+        if (batch == 1 && !c_.lossless && options_.ngram_draft_tokens > 0 && max_width_ > 1) {
+            const Lane& lane = lanes_[lanes[0]];
+            if (lane.schema_proposer) {
+                const auto ngram_limit = std::min<std::uint32_t>(
+                    static_cast<std::uint32_t>(max_width_ - 1), options_.ngram_draft_tokens);
+                draft_prefetch_.submit(lanes[0], lane.schema_proposer.get(), lane.history, drafts_[0],
+                                       ngram_limit, 3U);
+            }
+        }
         if (track_routes()) { residency_->enqueue_route_download(s, batch * W); }
 
         // Acceptance on the device, from compact candidates on unconstrained screened-head rounds or the
@@ -6078,11 +6348,13 @@ private:
                 std::int32_t* host_candidates = mtp_host(mtp_io_.verify_candidates);
                 auto* host_q                  = reinterpret_cast<float*>(mtp_host(mtp_io_.verify_q));
                 for (std::int32_t b = 0; b < batch; ++b) {
-                    const auto n = static_cast<std::int32_t>(drafts_[b].size());
-                    if (n == 0) { continue; }
+                    const auto n       = static_cast<std::int32_t>(drafts_[b].size());
+                    const auto side_n  = (row_is_tree_[b] && row_is_dual_chain_[b]) ? tree_side_count_[b] : 0;
+                    const auto total_n = n + side_n;
+                    if (total_n == 0) { continue; }
                     const std::size_t row = static_cast<std::size_t>(b) * K * C;
                     const std::int32_t neural_n =
-                        from_ngram_[b] ? 0 : (stitched_ngram_[b] ? neural_draft_count_[b] : n);
+                        (sampled && !from_ngram_[b]) ? (stitched_ngram_[b] ? neural_draft_count_[b] : n) : 0;
                     if (neural_n > 0) {
                         const std::int32_t nb = mtp_draft_row_[static_cast<std::size_t>(b)];
                         for (const auto [from, to] : {std::pair{mtp_io_.draft_candidates, mtp_io_.verify_candidates},
@@ -6091,7 +6363,7 @@ private:
                                                          mtp_device(from + static_cast<std::size_t>(C) * nb),
                                                          4ULL * C * mtp_draft_batch_, 4ULL * C,
                                                          static_cast<std::size_t>(neural_n), cudaMemcpyDeviceToDevice, s));
-                            if (row_is_tree_[b] && n < K) {
+                            if (row_is_tree_[b] && !row_is_dual_chain_[b] && n < K) {
                                 CUDA_CHECK(cudaMemcpyAsync(
                                     mtp_device(to + row + static_cast<std::size_t>(n) * C),
                                     mtp_device(from + static_cast<std::size_t>(C) * nb), 4ULL * C,
@@ -6099,10 +6371,11 @@ private:
                             }
                         }
                     }
-                    if (neural_n < n) {
-                        const std::size_t tail = static_cast<std::size_t>(n - neural_n);
-                        for (std::int32_t j = neural_n; j < n; ++j) {
-                            const std::int32_t token = drafts_[b][static_cast<std::size_t>(j)];
+                    if (neural_n < total_n) {
+                        const std::size_t tail = static_cast<std::size_t>(total_n - neural_n);
+                        for (std::int32_t j = neural_n; j < total_n; ++j) {
+                            const std::int32_t token = j < n ? drafts_[b][static_cast<std::size_t>(j)]
+                                                             : tree_side_tokens_[b][static_cast<std::size_t>(j - n)];
                             if (j == 0 && row_is_tree_[b] && from_ngram_[b] && tree_side_tokens_[b][0] != token) {
                                 const float q0           = ngram_alt_q0_[b];
                                 host_candidates[row + 0] = token;
@@ -6447,10 +6720,12 @@ private:
             const auto k = static_cast<std::int32_t>(d.accepted_tokens);
             if (k < 1 || k > pending_counts_[row]) { throw std::logic_error("Qwen4Exp: commit exceeds the licensed tokens"); }
             commit_constraint_draws(lane, static_cast<std::size_t>(k));
+            draft_prefetch_.wait_idle();
             for (std::int32_t j = 0; j < k; ++j) {
                 const std::int32_t token = pending_tokens_[static_cast<std::size_t>(row * W + j)];
                 lane.history.push_back(token);
                 if (lane.proposer) { lane.proposer->append(token); }
+                if (lane.schema_proposer) { lane.schema_proposer->append(token); }
                 if (cross_request_proposer_) { cross_request_proposer_->advance_cursor(lane.cross_cursor, token); }
             }
             fold_rows[row].commit_columns = k;
@@ -8388,12 +8663,15 @@ private:
     std::vector<std::uint32_t> ngram_slots_scratch_;
     std::vector<PagedKVBatchLayerView> kv_compact_layers_;
     std::array<bool, kMaximumConcurrency> row_is_tree_{};
+    std::array<bool, kMaximumConcurrency> row_is_dual_chain_{};
     std::array<std::int32_t, kMaximumConcurrency> tree_side_count_{};
-    std::array<std::array<std::int32_t, kMaxRootForkSides>, kMaximumConcurrency> tree_side_tokens_{};
+    std::array<std::array<std::int32_t, kMaxDualChainSideLen>, kMaximumConcurrency> tree_side_tokens_{};
     std::array<std::int32_t, kMaximumConcurrency> ngram_alt_token_{};
     std::array<float, kMaximumConcurrency> ngram_alt_q0_{};
+    std::array<bool, kMaximumConcurrency> ngram_proposal_structural_{};
     std::array<std::int32_t, kMaximumConcurrency> ngram_proposal_alt_token_{};
     std::array<float, kMaximumConcurrency> ngram_proposal_alt_q0_{};
+    DraftPrefetchWorker draft_prefetch_;
     std::vector<std::uint8_t> live_;
     std::vector<std::int32_t> window_;
     std::vector<std::uint32_t> row_ids_;

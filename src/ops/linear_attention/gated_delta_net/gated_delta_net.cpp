@@ -24,10 +24,10 @@ void require_dtype(const Tensor& t, DType dtype, const char* name) {
     if (t.dtype != dtype) { throw std::invalid_argument(std::string("gated_delta_net: ") + name); }
 }
 
-// The stored recurrent state: FP32, or FP16 (fp16-gdn-state).
+// The stored recurrent state: FP32, FP16 (fp16-gdn-state), or BF16 (bf16-gdn-state).
 void require_state_dtype(const Tensor& t, const char* name) {
-    if (t.dtype != DType::FP32 && t.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string("gated_delta_net: ") + name + " must be FP32 or FP16");
+    if (t.dtype != DType::FP32 && t.dtype != DType::FP16 && t.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string("gated_delta_net: ") + name + " must be FP32, FP16, or BF16");
     }
 }
 
@@ -290,7 +290,7 @@ void gated_delta_net(const Tensor& q, const Tensor& k, const Tensor& v, const Te
                                   v.ne[1],
                                   q.ne[2],
                                   scale,
-                                  ssm_state_out.dtype == DType::FP16};
+                                  ssm_state_out.dtype};
     chunked::launch_prepare(args, qk, control, normalize_qk, execution.stream, fp16);
     chunked::launch_recurrence(args, qk, control, execution, fp16);
 }

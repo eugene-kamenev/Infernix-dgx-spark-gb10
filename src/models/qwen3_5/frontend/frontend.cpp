@@ -940,6 +940,7 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
     if (impl_->ngram_sources_enabled) {
         result.ngram_boundaries = impl_->ngram_boundaries;
         std::size_t remaining   = impl_->max_context;
+        std::size_t structural_budget = std::min<std::size_t>(impl_->max_context, 4096U);
         if (tool_call_output && !tool_call_output->tools.empty() && remaining > 0) {
             std::size_t schema_budget = std::min<std::size_t>(remaining, 4096U);
             for (const auto& skeleton : fi::ngram_tool_schema_sources(tool_call_output->tools)) {
@@ -950,7 +951,31 @@ PreparedPrompt Frontend::prepare(PromptInput input, const PreparationControl& co
                 fi::check_preparation_control(control, "ngram tool schema sources");
                 schema_budget -= tokens.size();
                 remaining -= tokens.size();
+                if (structural_budget > 0) {
+                    const std::size_t keep = std::min(tokens.size(), structural_budget);
+                    result.structural_sources.emplace_back(tokens.begin(), tokens.begin() + static_cast<std::ptrdiff_t>(keep));
+                    structural_budget -= keep;
+                }
                 result.ngram_sources.push_back(std::move(tokens));
+            }
+        }
+        if (structural_budget > 0 && tool_call_output && !tool_call_output->tools.empty()) {
+            std::vector<std::string_view> message_texts;
+            for (const auto& message : messages) {
+                for (const auto& part : message.parts) {
+                    if (part.kind == fi::ChatPartKind::Text && !part.text.empty()) {
+                        message_texts.push_back(part.text);
+                    }
+                }
+            }
+            for (const auto& entity : fi::ngram_prompt_entity_sources(message_texts)) {
+                fi::check_preparation_control(control, "ngram structural entity sources");
+                if (structural_budget == 0) { break; }
+                auto tokens = impl_->tokenizer->encode(
+                    entity, {.parse_added_tokens = false, .max_tokens = structural_budget});
+                fi::check_preparation_control(control, "ngram structural entity sources");
+                structural_budget -= tokens.size();
+                result.structural_sources.push_back(std::move(tokens));
             }
         }
         for (const auto& message : messages) {

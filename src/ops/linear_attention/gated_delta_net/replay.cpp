@@ -118,9 +118,9 @@ void validate_replay_record(const Tensor& q, const Tensor& k, const Tensor& v, c
     require_tensor(v, DType::BF16, {kStateDim, value_heads, width, rows}, 2, kOp, "v");
     require_tensor(g, DType::FP32, {value_heads, width, rows}, 4, kOp, "g");
     require_tensor(beta, DType::FP32, {value_heads, width, rows}, 4, kOp, "beta");
-    // The pooled state: FP32, or FP16 under fp16-gdn-state.
-    if (states.dtype != DType::FP32 && states.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(kOp) + ": states must be FP32 or FP16");
+    // The pooled state: FP32, FP16 under fp16-gdn-state, or BF16 under bf16-gdn-state.
+    if (states.dtype != DType::FP32 && states.dtype != DType::FP16 && states.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string(kOp) + ": states must be FP32, FP16, or BF16");
     }
     require_tensor(states, states.dtype, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp,
                    "states");
@@ -206,7 +206,8 @@ void validate_fold_states(const GdnReplayRecords& records,
         state.value_heads != record.value_heads || state.value_head_dim != kStateDim ||
         state.key_head_dim != kStateDim || state.slot_count <= 0 ||
         state.conv_dtype != DType::BF16 ||
-        (state.recurrent_dtype != DType::FP32 && state.recurrent_dtype != DType::FP16)) {
+        (state.recurrent_dtype != DType::FP32 && state.recurrent_dtype != DType::FP16 &&
+         state.recurrent_dtype != DType::BF16)) {
         throw std::invalid_argument(std::string(kOp) + ": state geometry does not match records");
     }
     require_tensor(states.conv_layer0, DType::BF16, {record.conv_channels, 3, state.slot_count},
@@ -214,8 +215,9 @@ void validate_fold_states(const GdnReplayRecords& records,
     require_tensor(states.recurrent_layer0, state.recurrent_dtype,
                    {kStateDim, kStateDim, record.value_heads, state.slot_count}, 256, kOp,
                    "recurrent state layer 0");
-    const auto recurrent_element =
-        static_cast<std::int64_t>(state.recurrent_dtype == DType::FP16 ? sizeof(std::uint16_t) : sizeof(float));
+    const auto recurrent_element = static_cast<std::int64_t>(
+        (state.recurrent_dtype == DType::FP16 || state.recurrent_dtype == DType::BF16) ? sizeof(std::uint16_t)
+                                                                                       : sizeof(float));
     if (states.conv_layer_stride_bytes <= 0 || states.recurrent_layer_stride_bytes <= 0 ||
         states.conv_layer_stride_bytes % static_cast<std::int64_t>(sizeof(std::uint16_t)) != 0 ||
         states.recurrent_layer_stride_bytes % recurrent_element != 0 ||
@@ -334,8 +336,8 @@ void validate_replay_record_conv(const Tensor& qkv, const Tensor& conv_weight, c
     }
     require_tensor(a_log, DType::FP32, {value_heads}, 4, kOp, "A_log");
     require_tensor(dt_bias, DType::FP32, {value_heads}, 4, kOp, "dt_bias");
-    if (states.dtype != DType::FP32 && states.dtype != DType::FP16) {
-        throw std::invalid_argument(std::string(kOp) + ": states must be FP32 or FP16");
+    if (states.dtype != DType::FP32 && states.dtype != DType::FP16 && states.dtype != DType::BF16) {
+        throw std::invalid_argument(std::string(kOp) + ": states must be FP32, FP16, or BF16");
     }
     if (states.ne[3] <= 0) { throw std::invalid_argument(std::string(kOp) + ": state slot count must be positive"); }
     require_tensor(states, states.dtype, {kStateDim, kStateDim, value_heads, states.ne[3]}, 16, kOp, "states");

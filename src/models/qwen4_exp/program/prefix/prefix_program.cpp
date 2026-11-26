@@ -73,7 +73,7 @@ void ProgramImpl::create_prefix_cache() {
         }
     }
     image_layout_    = prefix::plan_state_image(prefix::state_image_spec(
-        c_, mtp_, options_.kv_cache, ring, options_.fp16_gdn_state ? DType::FP16 : DType::FP32));
+        c_, mtp_, options_.kv_cache, ring, options_.gdn_recurrent_dtype()));
     lane_image_      = std::make_unique<prefix::LaneStateImage>(
         image_layout_,
         prefix::LaneStateBuffers{.gdn       = gdn_.get(),

@@ -112,6 +112,9 @@ enum class FastPath : std::uint8_t {
     // FP8 weights whose permission is 16-bit activations: prefill-width projections carry the
     // activation as two E4M3 terms on the 8-bit Tensor Core path (ops::LinearRoutes::Fp8A8Pair).
     Fp8A8Pair,
+    // MXFP8 dense projections (fp8_e4m3fn_g32_e8m0): prefill-width projections quantize activations
+    // to a single E4M3 term with per-32 UE8M0 block scales (ops::LinearRoutes::Mxfp8A8).
+    Mxfp8A8,
     // The same projections and widths as fp8-a8-pair, with each term's power-of-two scale per 32
     // values of K instead of per column, applied by the block-scaled MMA
     // (ops::LinearRoutes::Fp8A8PairBlock32): every value within 2^14 of its block's maximum is carried
@@ -284,6 +287,9 @@ enum class FastPath : std::uint8_t {
     // FP32). Calls follow the request alone on the reproducible route, so its output stays
     // request-invariant. Without it the state is FP32.
     Fp16GdnState,
+    // Every GDN model: store the GDN recurrent state pool as BF16 instead of FP32, halving state
+    // DRAM traffic in every decode, verification and prefill call while keeping FP32's 8-bit exponent range.
+    Bf16GdnState,
     // Speculative rounds whose drafts carry their proposal laws (DFlash2, sampled-mtp-drafts): a
     // sampled row's chain is accepted by block verification (Sun et al., arXiv 2403.10444;
     // ops::speculative_accept_sparse_drafts) instead of token by token. Its output distribution is the
@@ -305,11 +311,12 @@ enum class FastPath : std::uint8_t {
     GdnTreeClosedForm,
 };
 
-inline constexpr std::array<FastPath, 40> kFastPaths{
+inline constexpr std::array<FastPath, 42> kFastPaths{
     FastPath::PromptPv8,           FastPath::DecodeSplit64,
     FastPath::Q8SlicedK,           FastPath::GdnConvFused,
     FastPath::QsaPrepareFused,     FastPath::Fp8A8Pair,
-    FastPath::Fp8A8PairBlock32,    FastPath::Nvfp4A4Pair,
+    FastPath::Mxfp8A8,             FastPath::Fp8A8PairBlock32,
+    FastPath::Nvfp4A4Pair,
     FastPath::Q4W4A8,              FastPath::SampledMtpDrafts,
     FastPath::GdnF16Accumulate,    FastPath::Q5KSplitMma,
     FastPath::BatchedDecode,       FastPath::BatchedA8Decode,
@@ -325,8 +332,8 @@ inline constexpr std::array<FastPath, 40> kFastPaths{
     FastPath::GgmlBf16Prefill,     FastPath::F16AccumulatePrefill,
     FastPath::Bf16PromptSplit,     FastPath::RouterMma,
     FastPath::ScreenedLmHead,      FastPath::Fp16GdnState,
-    FastPath::BlockVerification,   FastPath::UniverTrees,
-    FastPath::GdnTreeClosedForm};
+    FastPath::Bf16GdnState,        FastPath::BlockVerification,
+    FastPath::UniverTrees,         FastPath::GdnTreeClosedForm};
 
 [[nodiscard]] constexpr const char* fast_path_name(FastPath path) noexcept {
     switch (path) {
@@ -355,6 +362,7 @@ inline constexpr std::array<FastPath, 40> kFastPaths{
     case FastPath::QsaPrepareFused: return "qsa-prepare-fused";
     case FastPath::IdleWidePrefill: return "idle-wide-prefill";
     case FastPath::Fp8A8Pair: return "fp8-a8-pair";
+    case FastPath::Mxfp8A8: return "mxfp8-a8";
     case FastPath::Fp8A8PairBlock32: return "fp8-a8-pair-block32";
     case FastPath::Nvfp4A4Pair: return "nvfp4-a4-pair";
     case FastPath::Q4W4A8: return "q4-w4a8";
@@ -367,6 +375,7 @@ inline constexpr std::array<FastPath, 40> kFastPaths{
     case FastPath::RouterMma: return "router-mma";
     case FastPath::ScreenedLmHead: return "screened-lm-head";
     case FastPath::Fp16GdnState: return "fp16-gdn-state";
+    case FastPath::Bf16GdnState: return "bf16-gdn-state";
     case FastPath::BlockVerification: return "block-verification";
     case FastPath::UniverTrees: return "univer-trees";
     case FastPath::GdnTreeClosedForm: return "gdn-tree-closed-form";

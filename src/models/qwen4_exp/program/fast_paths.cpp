@@ -579,13 +579,8 @@ constexpr std::array kQualified{
     Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
     Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
     Qualification{FastPath::UniverTrees, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
-    Qualification{FastPath::GdnF16Accumulate, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    // gdn-f16-accumulate stays opt-in for Nvfp4 + a4=true: chunked FP16 snapshot/delta/QK
+    // rounding over 12288 prefill chunks flips FastQ-RHT16 at 210K context (`at_jag` greedy STOP).
     Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
     Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
     Qualification{FastPath::QsaPrepareFused, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
@@ -598,13 +593,10 @@ constexpr std::array kQualified{
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
     Qualification{FastPath::Nvfp4A4Pair, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::BFloat16}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Int8Group64}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8E4M3Row256}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Nvfp4Group16}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Fp8KeyNvfp4Value}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Vq2}},
-    Qualification{FastPath::Fp16GdnState, {DenseKernels::Nvfp4, true, KvCacheStorage::Q4KeyVq2Value}},
+    // fp16-gdn-state stays an opt-in candidate (--fast-path fp16-gdn-state), matching all other
+    // qwen4_exp configurations: 36-layer FP16 recurrent-state rounding across 210K+ context
+    // degrades 262K NIAH (premature_eos_mid_enumeration at 284/2048 on FastQ-RHT16 seed=1234)
+    // while offering <1% decode gain.
     // W4Dense (NVFP4 dense), both expert activation precisions and every KV format (task T1,
     // 2026-10-30): dflash2-pairs joins the owner's every-configuration registration of 2026-10-24
     // (T7 found this dense kind missing, so DFlash2 decoded plain at concurrency 2 on the artifact;
@@ -812,6 +804,9 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::Fp8A8Pair: return configuration.dense == DenseKernels::Fp8Row;
     case FastPath::Fp8A8PairBlock32:
         return configuration.dense == DenseKernels::Fp8Row || configuration.dense == DenseKernels::Mxfp8;
+    // MXFP8 attention/dense projections appear both in MXFP8 artifacts and hybrid FastQ-RHT16 (DenseKernels::Nvfp4).
+    case FastPath::Mxfp8A8:
+        return configuration.dense == DenseKernels::Mxfp8 || configuration.dense == DenseKernels::Nvfp4;
     // W4Dense's and mixed MXFP8/NVFP4 artifacts' NVFP4 dense projections run 16-bit activations (A16Only)
     // at narrow widths and the two-term row-scaled A4 TMA route at prefill widths.
     case FastPath::Nvfp4A4Pair:
@@ -866,7 +861,8 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::ScreenedLmHead:
         return options.purpose == EnginePurpose::Generation && configuration.dense != DenseKernels::Ggml;
     // Every Flash-Next artifact's 36 GDN layers.
-    case FastPath::Fp16GdnState: return true;
+    case FastPath::Fp16GdnState:
+    case FastPath::Bf16GdnState: return true;
     // Chains whose drafts carry their proposal laws: DFlash2's (--draft-model) and MTP's under
     // sampled-mtp-drafts.
     case FastPath::BlockVerification:
@@ -914,7 +910,7 @@ bool FastPathSelection::request_invariant() const noexcept {
                path == FastPath::ExpertA4Residual || path == FastPath::ExpertA4Residual3 ||
                path == FastPath::ExpertA4ResidualDecode || path == FastPath::ExpertA4OmmaNarrow ||
                path == FastPath::Fp8A8Pair || path == FastPath::Fp8A8PairBlock32 ||
-               path == FastPath::Nvfp4A4Pair ||
+               path == FastPath::Mxfp8A8 || path == FastPath::Nvfp4A4Pair ||
                path == FastPath::GgmlBf16Prefill || path == FastPath::F16AccumulatePrefill ||
                path == FastPath::RouterMma || path == FastPath::ScreenedLmHead;
     });
@@ -931,6 +927,7 @@ execution::ForwardFastPaths FastPathSelection::forward() const noexcept {
     ops::LinearRoutes prefill = ops::LinearRoutes::Exact;
     if (selected(FastPath::GgmlBf16Prefill)) { prefill = prefill | ops::LinearRoutes::GgmlBf16Wide; }
     if (selected(FastPath::F16AccumulatePrefill)) { prefill = prefill | ops::LinearRoutes::F16Accumulate; }
+    if (selected(FastPath::Mxfp8A8)) { prefill = prefill | ops::LinearRoutes::Mxfp8A8; }
     return {.dense_routes          = routes,
             .prefill_routes        = prefill,
             .gdn_conv_fused        = selected(FastPath::GdnConvFused),
@@ -963,6 +960,9 @@ FastPathSelection select_fast_paths(const execution::Parameters& parameters, con
                                fast_path_qualified(path, out.configuration) &&
                                (path != FastPath::ScreenedLmHead || parameters.output_head_screen.has_value());
         if (candidate || qualified) { out.paths.push_back(path); }
+    }
+    if (out.selected(FastPath::Bf16GdnState) && out.selected(FastPath::Fp16GdnState)) {
+        throw std::invalid_argument("bf16-gdn-state and fp16-gdn-state cannot both be selected");
     }
     return out;
 }

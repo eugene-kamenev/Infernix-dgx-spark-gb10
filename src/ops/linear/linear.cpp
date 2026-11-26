@@ -157,6 +157,10 @@ std::size_t linear_fp8_a8_pair_block32_workspace_bytes(std::int32_t input_rows, 
     return detail::fp8_a8_pair_block32_workspace_capacity_bytes(tokens, input_rows);
 }
 
+std::size_t linear_mxfp8_a8_workspace_bytes(std::int32_t input_rows, std::int32_t tokens) {
+    return detail::fp8_a8_block32_workspace_capacity_bytes(tokens, input_rows);
+}
+
 std::size_t linear_workspace_capacity_bytes(QType qtype, std::int32_t output_rows,
                                             std::int32_t input_rows, LinearPolicy policy,
                                             std::int32_t min_tokens, std::int32_t max_tokens) {

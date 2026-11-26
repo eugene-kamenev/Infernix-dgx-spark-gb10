@@ -187,11 +187,14 @@ __device__ __forceinline__ float saturate_fp16_state(float value) {
 
 __device__ __forceinline__ float stored_state(float value) { return value; }
 __device__ __forceinline__ float stored_state(__half value) { return __half2float(value); }
+__device__ __forceinline__ float stored_state(__nv_bfloat16 value) { return __bfloat162float(value); }
 
 template <class State>
 __device__ __forceinline__ State state_to_store(float value) {
     if constexpr (std::is_same_v<State, float>) {
         return value;
+    } else if constexpr (std::is_same_v<State, __nv_bfloat16>) {
+        return __float2bfloat16_rn(value);
     } else {
         return __float2half_rn(saturate_fp16_state(value));
     }
@@ -540,7 +543,12 @@ void dispatch_state(const Arguments& args, const QkChunk* qk, const ControlChunk
 template <int DV>
 void dispatch(const Arguments& args, const QkChunk* qk, const ControlChunk* control,
               cudaStream_t stream, bool fp16) {
-    if (args.fp16_state) return dispatch_state<DV, __half>(args, qk, control, stream, fp16);
+    if (args.state_dtype == DType::BF16) {
+        return dispatch_state<DV, __nv_bfloat16>(args, qk, control, stream, fp16);
+    }
+    if (args.state_dtype == DType::FP16) {
+        return dispatch_state<DV, __half>(args, qk, control, stream, fp16);
+    }
     return dispatch_state<DV, float>(args, qk, control, stream, fp16);
 }
 

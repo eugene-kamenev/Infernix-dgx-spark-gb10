@@ -90,6 +90,9 @@ enum class LinearRoutes : std::uint16_t {
     /// nvfp4-a4-pair: NVFP4 weights (W4A16) with the activation carried as two row-scaled NVFP4
     /// terms on the 4-bit Tensor Core path.
     Nvfp4A4Pair = 1024,
+    /// mxfp8-a8: MXFP8 weights (fp8_e4m3fn_g32_e8m0) at prefill widths with single-term E4M3 + UE8M0
+    /// block-32 activations on the block-scaled FP8 Tensor Core path.
+    Mxfp8A8 = 2048,
 };
 
 [[nodiscard]] constexpr LinearRoutes operator|(LinearRoutes a, LinearRoutes b) noexcept {
@@ -101,7 +104,7 @@ enum class LinearRoutes : std::uint16_t {
 }
 
 [[nodiscard]] constexpr bool valid_linear_routes(LinearRoutes routes) noexcept {
-    return (static_cast<std::uint16_t>(routes) & ~std::uint16_t{2047}) == 0;
+    return (static_cast<std::uint16_t>(routes) & ~std::uint16_t{4095}) == 0;
 }
 
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
@@ -175,6 +178,13 @@ enum class LinearRoutes : std::uint16_t {
  */
 [[nodiscard]] std::size_t linear_fp8_a8_pair_block32_workspace_bytes(std::int32_t input_rows,
                                                                      std::int32_t tokens);
+
+/**
+ * The transient bytes LinearRoutes::Mxfp8A8 needs for a call of `tokens` columns of K =
+ * `input_rows`, a multiple of 128 (the activation's single E4M3 plane and per-32-value UE8M0 scales).
+ */
+[[nodiscard]] std::size_t linear_mxfp8_a8_workspace_bytes(std::int32_t input_rows,
+                                                          std::int32_t tokens);
 
 /**
  * @brief Applies a bias-free matrix projection independently to every input column.

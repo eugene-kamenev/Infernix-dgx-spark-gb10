@@ -20,15 +20,17 @@ static_assert(sizeof(GdnReplayFoldKernelRows) == 128);
 static_assert(alignof(GdnReplayFoldKernelRows) == 16);
 static_assert(std::is_trivially_copyable_v<GdnReplayFoldKernelRows>);
 
-// Runs `launch` with the stored state's element type: FP32, or FP16 (fp16-gdn-state).
+// Runs `launch` with the stored state's element type: FP32, FP16 (fp16-gdn-state), or BF16 (bf16-gdn-state).
 template <class Launch>
 void with_state_type(const Tensor& state, Launch&& launch) {
     if (state.dtype == DType::FP32) {
         launch.template operator()<float>();
     } else if (state.dtype == DType::FP16) {
         launch.template operator()<__half>();
+    } else if (state.dtype == DType::BF16) {
+        launch.template operator()<__nv_bfloat16>();
     } else {
-        throw std::invalid_argument("gated_delta_net: the recurrent state must be FP32 or FP16");
+        throw std::invalid_argument("gated_delta_net: the recurrent state must be FP32, FP16, or BF16");
     }
 }
 

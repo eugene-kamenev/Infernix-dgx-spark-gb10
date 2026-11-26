@@ -5,6 +5,7 @@ namespace infernix::models::qwen4_exp {
 namespace detail {
 
 ProgramImpl::~ProgramImpl() noexcept {
+    draft_prefetch_.shutdown();
     if (device_.transfer_stream != nullptr) { (void)cudaStreamSynchronize(device_.transfer_stream); }
     if (device_.stream != nullptr) { (void)cudaStreamSynchronize(device_.stream); }
 }

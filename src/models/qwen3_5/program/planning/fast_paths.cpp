@@ -435,6 +435,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::IdleWidePrefill: return true;
     // The FP8 sites of the Qwen3.8-27B recipes already permit single-term A8 at prefill widths.
     case FastPath::Fp8A8Pair:
+    case FastPath::Mxfp8A8:
     case FastPath::Fp8A8PairBlock32:
     case FastPath::Nvfp4A4Pair: return false;
     // The W4A8 gate/up kernel runs only on groupwise Q4 weights (the text MLP's linear_swiglu).
@@ -473,6 +474,7 @@ bool fast_path_applies(FastPath path, const FastPathConfiguration& configuration
     case FastPath::ScreenedLmHead: return false; // Qwen3.8-Flash-Next's screened head only
     // Every Qwen3.5 artifact has GDN layers; qualified on the 27Bs with INT8 KV (kQualified).
     case FastPath::Fp16GdnState: return true;
+    case FastPath::Bf16GdnState: return false;
     // Chains whose drafts carry their proposal laws: DFlash2's, and MTP's under sampled-mtp-drafts
     // (without it MTP drafts argmax chains, which the block rule cannot improve and the greedy-draft
     // verifier serves). Qualified nowhere yet, so it runs only as a candidate.

@@ -143,6 +143,8 @@ struct PreparedTapHints {
 struct PreparedPromptData {
     // Proposal-only sources, never part of target tokens, positions or cache identity.
     std::vector<std::vector<TokenId>> ngram_sources;
+    // Bounded structural sources (tool schema skeletons + prompt entities) for L3-resident fast lookup.
+    std::vector<std::vector<TokenId>> structural_sources;
     std::vector<TokenId> ngram_boundaries;
     std::vector<NgramSourceView> ngram_archive_sources;
     std::shared_ptr<const NgramSnapshot> ngram_snapshot;
