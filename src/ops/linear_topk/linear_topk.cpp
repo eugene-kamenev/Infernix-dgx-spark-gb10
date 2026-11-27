@@ -4,6 +4,7 @@
 #include "infernix/ops/linear.h"
 #include "infernix/ops/rg16_linear.h"
 #include "ops/linear/fp8/fp8_format.h"
+#include "ops/linear/nvfp4/nvfp4_format.h"
 #include "ops/linear_topk/linear_topk_launch.h"
 #include "ops/linear_topk/linear_topk_workspace.h"
 
@@ -21,14 +22,15 @@ enum class HeadProfile : std::uint8_t {
     Fp8Full,
     Q4Optimized,
     Nvfp4Full,
-    // Qwen3.5-122B-A10B's per-row FP8 head (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4): its FP32
-    // logits through linear, then the NVFP4 head's grouped selection.
-    Fp8F32Full,
+    // Heads whose FP32 logits come from linear, then the NVFP4 head's grouped selection: Qwen3.5-122B-A10B's
+    // per-row FP8 head (dealignai's Ornith-1.5-122B-UNCENSORED-NVFP4) and the 27B head NVIDIA's NVFP4-QAD
+    // stores as NVFP4 (block_scale_k16_m128x4_v1, run as QType::NVFP4).
+    LinearFull,
 };
 
 // The profiles whose logits are materialized before the grouped selection.
 bool materialized(HeadProfile profile) {
-    return profile == HeadProfile::Nvfp4Full || profile == HeadProfile::Fp8F32Full;
+    return profile == HeadProfile::Nvfp4Full || profile == HeadProfile::LinearFull;
 }
 
 bool aligned_to(const void* pointer, std::uintptr_t alignment) {
@@ -73,7 +75,10 @@ HeadProfile resolve_profile(QType qtype, std::int32_t head_rows, std::int32_t in
     }
     if (head_rows == detail::kLinearTopKFullRows && qtype == QType::FP8_E4M3FN_ROW_F32 &&
         input_rows == detail::kLinearTopK122BHidden) {
-        return HeadProfile::Fp8F32Full;
+        return HeadProfile::LinearFull;
+    }
+    if (head_rows == detail::kLinearTopKFullRows && qtype == QType::NVFP4 && input_rows == detail::kLinearTopKHidden) {
+        return HeadProfile::LinearFull;
     }
     throw std::invalid_argument("linear_topk: unsupported head profile");
 }
@@ -194,9 +199,10 @@ void require_nvfp4(const Weight& head) {
 void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                                const Tensor& candidate_ids, const Tensor& candidate_scores,
                                const Tensor* id_map, const detail::LinearTopKWorkspace& scratch) {
-    // An nvfp4_rg16_v1 head keeps its scales inside its payload.
+    // An nvfp4_rg16_v1 head keeps its scales inside its payload; a BlockScale NVFP4 head has an E4M3 word
+    // per 16 values.
     const std::size_t code_bytes = head.qtype == QType::NVFP4_MUL ? static_cast<std::size_t>(head.payload_bytes)
-                                   : head.qtype == QType::Q4_G64_FP16
+                                   : head.qtype == QType::Q4_G64_FP16 || head.qtype == QType::NVFP4
                                        ? static_cast<std::size_t>(head.n) * head.k / 2
                                        : static_cast<std::size_t>(head.n) * head.k;
     const std::size_t scale_bytes =
@@ -204,6 +210,8 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
             ? static_cast<std::size_t>(head.n) * (head.k / 32) * sizeof(std::uint16_t)
         : head.qtype == QType::Q4_G64_FP16
             ? static_cast<std::size_t>(head.n) * (head.k / 64) * sizeof(std::uint16_t)
+        : head.qtype == QType::NVFP4
+            ? static_cast<std::size_t>(head.n) * (head.k / 16)
         : head.qtype == QType::NVFP4_MUL
             ? std::size_t{0}
         : head.qtype == QType::FP8_E4M3FN_ROW_F32
@@ -213,9 +221,7 @@ void require_no_weight_overlap(const Weight& head, const Tensor& hidden,
                             &candidate_ids,
                             &candidate_scores,
                             &scratch.partial_keys,
-                            &scratch.group_keys,
-                            &scratch.secondary_keys,
-                            &scratch.group_done,
+                            &scratch.slice_keys,
                             id_map};
     for (const Tensor* tensor : tensors) {
         if (tensor == nullptr) { continue; }
@@ -230,8 +236,7 @@ void require_scratch_nonoverlap(const Tensor& hidden, const Tensor& candidate_id
                                 const Tensor& candidate_scores, const Tensor* id_map,
                                 const detail::LinearTopKWorkspace& scratch) {
     const Tensor* live[]{&hidden, &candidate_ids, &candidate_scores, id_map};
-    const Tensor* work[]{&scratch.partial_keys, &scratch.group_keys, &scratch.secondary_keys,
-                         &scratch.group_done};
+    const Tensor* work[]{&scratch.partial_keys, &scratch.slice_keys};
     for (const Tensor* lhs : live) {
         if (lhs == nullptr) { continue; }
         for (const Tensor* rhs : work) {
@@ -318,7 +323,7 @@ std::size_t linear_topk_workspace_capacity_bytes(QType qtype, std::int32_t head_
         if (profile == HeadProfile::Nvfp4Full) {
             (void)layout.alloc(DType::FP32, {head_rows, columns}, 256);
             (void)layout.alloc_bytes(rg16_linear_workspace_bytes(head_rows, input_rows, columns));
-        } else if (profile == HeadProfile::Fp8F32Full) {
+        } else if (profile == HeadProfile::LinearFull) {
             (void)layout.alloc(DType::FP32, {head_rows, columns}, 256);
             (void)layout.alloc_bytes(
                 linear_workspace_capacity_bytes(qtype, head_rows, input_rows, LinearPolicy::A16Only, columns, columns));
@@ -340,8 +345,8 @@ void linear_topk(const Tensor& hidden, const Weight& head, std::int32_t valid_ro
         require_q8(head);
     } else if (profile == HeadProfile::Nvfp4Full) {
         require_nvfp4(head);
-    } else if (profile == HeadProfile::Fp8F32Full) {
-        (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
+    } else if (profile == HeadProfile::LinearFull && head.qtype == QType::NVFP4) {
+        (void)detail::validate_nvfp4_weight(head, "linear_topk NVFP4 full head");
     } else {
         (void)detail::validate_fp8_weight(head, "linear_topk FP8 full head");
     }
@@ -366,6 +371,55 @@ void linear_topk(const Tensor& hidden, const Weight& head, const Tensor& row_to_
     }
 
     execute(hidden, head, &row_to_global_ids, candidate_ids, candidate_scores, workspace, stream);
+}
+
+std::size_t logits_topk_workspace_capacity_bytes(std::int32_t rows, std::int32_t min_columns, std::int32_t max_columns) {
+    if (rows < detail::kLinearTopK || min_columns < 1 || max_columns < min_columns) {
+        throw std::invalid_argument("logits_topk workspace: invalid rows or column interval");
+    }
+    // A call runs in chunks of at most kLinearTopKMaxChunkColumns columns; every chunk width up to the widest
+    // reachable one is counted (the scratch grows with the width, so the widest decides).
+    WorkspaceLayoutBuilder layout;
+    const std::int32_t widest = std::min(max_columns, detail::kLinearTopKMaxChunkColumns);
+    for (std::int32_t columns = 1; columns <= widest; ++columns) {
+        auto scope = layout.scope();
+        (void)detail::allocate_linear_topk_workspace(layout, rows, columns, detail::kLogitsTopKRows);
+    }
+    return layout.peak_bytes();
+}
+
+void logits_topk(const Tensor& logits, std::int32_t valid_rows, Tensor& candidate_ids, Tensor& candidate_scores,
+                 WorkspaceArena& workspace, cudaStream_t stream) {
+    if (logits.dtype != DType::FP32 || logits.ne[1] <= 0 || logits.ne[2] != 1 || logits.ne[3] != 1 ||
+        !logits.is_contiguous() || valid_rows < detail::kLinearTopK || valid_rows > logits.ne[0]) {
+        throw std::invalid_argument("logits_topk: invalid logits or valid_rows");
+    }
+    const std::int32_t total = logits.ne[1];
+    const auto require_output = [&](const Tensor& tensor, DType dtype, const char* label) {
+        if (tensor.dtype != dtype || tensor.ne[0] != detail::kLinearTopK || tensor.ne[1] != total ||
+            tensor.ne[2] != 1 || tensor.ne[3] != 1 || !tensor.is_contiguous() || !aligned_to(tensor.data, 16)) {
+            throw std::invalid_argument(std::string("logits_topk: invalid ") + label); // the merge stores float4
+        }
+    };
+    require_output(candidate_ids, DType::I32, "candidate_ids");
+    require_output(candidate_scores, DType::FP32, "candidate_scores");
+    if (overlaps(logits, candidate_ids) || overlaps(logits, candidate_scores) ||
+        overlaps(candidate_ids, candidate_scores)) {
+        throw std::invalid_argument("logits_topk: input and outputs must not overlap");
+    }
+    for (std::int32_t first = 0; first < total;) {
+        const std::int32_t columns = std::min(detail::kLinearTopKMaxChunkColumns, total - first);
+        auto scope                 = workspace.scope();
+        const auto scratch =
+            detail::allocate_linear_topk_workspace(workspace, logits.ne[0], columns, detail::kLogitsTopKRows);
+        require_scratch_nonoverlap(logits, candidate_ids, candidate_scores, nullptr, scratch);
+        const Tensor x     = column_slice(logits, first, columns);
+        Tensor out_ids     = column_slice(candidate_ids, first, columns);
+        Tensor out_scores  = column_slice(candidate_scores, first, columns);
+        detail::logits_topk_warp_launch(x, valid_rows, scratch, stream);
+        detail::linear_topk_merge_launch(scratch, out_ids, out_scores, stream);
+        first += columns;
+    }
 }
 
 } // namespace infernix::ops

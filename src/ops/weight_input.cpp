@@ -59,6 +59,14 @@ bool contiguous(const WeightView& view) {
 }
 
 LinearPolicy common_policy(std::span<const WeightInput> inputs) {
+    const auto a8_only_inputs = std::count_if(inputs.begin(), inputs.end(),
+                                              [](const WeightInput& input) { return a8_only(input.policy); });
+    if (a8_only_inputs != 0) {
+        if (a8_only_inputs != static_cast<std::ptrdiff_t>(inputs.size())) {
+            throw std::invalid_argument("a shared projection input mixes A8Only with other activation policies");
+        }
+        return LinearPolicy::A8Only;
+    }
     auto result = LinearPolicy::AllowA4;
     for (const auto& input : inputs) {
         switch (input.policy) {
@@ -82,7 +90,25 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
     const auto region = contiguous_weight_region(view);
     const auto policy = common_policy(inputs);
     float divisor     = 0;
-    if (region.parent->geometry.format == QType::NVFP4) {
+    float nvfp4_scale = 0;
+    if (region.parent->geometry.format == QType::NVFP4_MUL &&
+        region.parent->geometry.layout == QuantLayout::BlockScaleK16M128x4) {
+        require(std::isfinite(region.parent->weight_multiplier) && region.parent->weight_multiplier > 0,
+                "an nvfp4_mul parent requires a positive multiplier");
+        for (const auto& input : inputs) {
+            if (!input.activation_input_scale) {
+                require(!allows_a4(policy), "an nvfp4_mul A4 input requires its activation scale");
+                continue;
+            }
+            require(std::isfinite(*input.activation_input_scale) && *input.activation_input_scale > 0,
+                    "an nvfp4_mul input requires a positive activation scale");
+            require(nvfp4_scale == 0 || std::bit_cast<std::uint32_t>(nvfp4_scale) ==
+                                            std::bit_cast<std::uint32_t>(*input.activation_input_scale),
+                    "a shared nvfp4_mul input requires identical activation scales");
+            nvfp4_scale = *input.activation_input_scale;
+        }
+        divisor = nvfp4_scale > 0 ? 1.0F / nvfp4_scale : 1.0F;
+    } else if (region.parent->geometry.format == QType::NVFP4) {
         require(std::isfinite(region.parent->weight_scale_divisor) &&
                     region.parent->weight_scale_divisor > 0,
                 "NVFP4 parent requires a positive weight divisor");
@@ -110,6 +136,7 @@ SingleProjectionWeight single(std::span<const WeightInput> inputs) {
         if (divisor == 0) { divisor = 1.0F; }
     }
     auto weight = native_weight(view, divisor);
+    weight.input_scale = nvfp4_scale;
     if (region.parent->geometry.format == QType::FP8_E4M3FN_ROW_F32) {
         // A static A8 parent's inputs share one activation encoding, so one calibrated scale. A parent
         // whose inputs carry none (ModelOpt FP8_PER_CHANNEL_PER_TOKEN) encodes each activation column
@@ -166,7 +193,7 @@ ProjectionWeights input_projection(std::span<const WeightInput, 4> inputs, bool 
         const bool supported =
             (moe && format == QType::Q8_G32_FP16) ||
             (moe_122b && format == QType::FP8_E4M3FN_ROW_F32) ||
-            (dense && (format == QType::NVFP4 || format == QType::FP8_E4M3FN_ROW_BF16 ||
+            (dense && (format == QType::NVFP4 || is_fp8_row(format) ||
                        (attention && format == QType::BF16)));
         require(supported, "input projection: unsupported single-parent format");
         return result;
@@ -193,10 +220,11 @@ SingleProjectionWeight prepare_attn_input_proj_weights(const WeightInput& query,
                                                        const WeightInput& key,
                                                        const WeightInput& value) {
     const auto& q = matrix(query);
-    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's, Qwen3.8-Flash-Next's and Qwen3.5-122B-A10B's
-    // DFlash2 drafters (H 5120, 2560 and 3072).
+    // The 35B-A3B DFlash drafter (H 2048), Qwen3.8-27B's, Qwen3.8-Flash-Next's, Qwen3.5-122B-A10B's and Inkling 2
+    // Mini's DFlash2 drafters (H 5120, 2560, 3072 and 2304).
     require((q == std::vector<std::uint64_t>{4096, 2048} || q == std::vector<std::uint64_t>{4096, 2560} ||
-             q == std::vector<std::uint64_t>{4096, 5120} || q == std::vector<std::uint64_t>{4096, 3072}) &&
+             q == std::vector<std::uint64_t>{4096, 5120} || q == std::vector<std::uint64_t>{4096, 3072} ||
+             q == std::vector<std::uint64_t>{4096, 2304}) &&
                 matrix(key) == std::vector<std::uint64_t>{1024, q[1]} &&
                 matrix(value) == matrix(key),
             "QKV input projection: unsupported logical geometry");

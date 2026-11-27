@@ -41,6 +41,12 @@ enum class QType : std::uint16_t {
     // E4M3FN codes with one FP32 multiplier per row (row_scale_v1): ModelOpt's per-tensor FP32
     // weight_scale kept exactly, written into each row of its matrix (tensor-formats.md).
     FP8_E4M3FN_ROW_F32 = 22,
+    // BF16 weights packed losslessly at load into 12 bits a weight (layout P12Rows; never stored in an
+    // artifact): every weight decodes to its BF16 bits (include/infernix/ops/bf16_p12.h).
+    BF16_P12 = 23,
+    // GGUF Q8_0 blocks (an FP16 scale, then 32 int8 codes): the block geometry of Q8_0 PLE n-gram rows
+    // (ops::ple_embed_q8_0), never a stored Weight format; Q8_0 matrices are imported as Q8_G32_FP16.
+    GGML_Q8_0 = 24,
 };
 
 // Whether `format` is a row-scaled FP8 format (row_scale_v1: BF16 or FP32 row multipliers).
@@ -80,6 +86,10 @@ enum class QuantLayout : std::uint16_t {
     // of W is transformed by the canonical signed block-16 Hadamard matrix Q = diag(s) * H16 / 4;
     // linear consumers apply the identical transform to activations x before GEMM/quantization.
     BlockScaleK16M128x4Rht16 = 12,
+    // bf16_p12 (BF16_P12 only): [n, k] with k a multiple of 8, as four planes (each 256-byte aligned).
+    P12Rows = 13,
+    // mxfp8_expert_rg16_v1 (FP8_E4M3FN_G32_E8M0 only).
+    Mxfp8ExpertRg16 = 14,
 };
 
 // Whether `layout` stores a matrix in BlockScaleK16M128x4 geometry (standard or RHT-16).
@@ -96,7 +106,8 @@ enum class QuantLayout : std::uint16_t {
 // Whether `layout` stores routed-expert banks (one 4 KiB-aligned record per expert).
 [[nodiscard]] constexpr bool is_expert_bank_layout(QuantLayout layout) noexcept {
     return layout == QuantLayout::ExpertRg16 || layout == QuantLayout::GgmlExpertIq4Nl ||
-           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::Fp8ExpertB128;
+           layout == QuantLayout::GgmlExpertQ2_0 || layout == QuantLayout::Fp8ExpertB128 ||
+           layout == QuantLayout::Mxfp8ExpertRg16;
 }
 
 struct Weight {
@@ -126,6 +137,8 @@ struct Weight {
     // A static FP8 A8 input: its FP32 activation scale s (codes e4m3(x * fl32(1 / s))), as stored;
     // 0 when the input has none.
     float input_scale = 0.0F;
+    // bf16_p12: the parent's escape list.
+    const void* escapes = nullptr;
 };
 
 } // namespace infernix

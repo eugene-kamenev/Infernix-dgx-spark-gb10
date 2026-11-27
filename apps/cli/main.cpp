@@ -374,6 +374,8 @@ int main(int argc, char** argv) {
 
         infernix::EngineOptions engine_options;
         engine_options.artifact_path            = cli.artifact_path;
+        engine_options.lora_path                = cli.lora_path;
+        engine_options.ablate_sidecar_path      = cli.ablate_sidecar_path;
         engine_options.chat_template_path       = cli.chat_template_path;
         engine_options.ngram_volume_path        = cli.ngram_volume_path;
         engine_options.expert_stripe_path       = cli.expert_stripe_path;
@@ -393,10 +395,14 @@ int main(int argc, char** argv) {
         engine_options.vram_headroom_bytes      = cli.vram_headroom_bytes;
         engine_options.expert_tail_skip         = cli.expert_tail_skip;
         engine_options.expert_a4_activations    = cli.expert_a4_activations;
+        engine_options.expert_a16_activations   = cli.expert_a16_activations;
         engine_options.a8_activations           = cli.a8_activations;
+        engine_options.q8_weights               = cli.q8_weights;
+        engine_options.w4_weights               = cli.w4_weights;
         engine_options.embedding_host           = cli.embedding_host;
         engine_options.prefill_chunk            = cli.prefill_chunk;
         engine_options.kv_cache                 = cli.kv_cache;
+        engine_options.kv_window_cache          = cli.kv_window_cache;
         engine_options.logits_dtype             = cli.logits_dtype;
         engine_options.original_int8_prefill_kernel = cli.original_int8_prefill_kernel;
         engine_options.prefill_split_workspace_mib  = cli.prefill_split_workspace_mib;

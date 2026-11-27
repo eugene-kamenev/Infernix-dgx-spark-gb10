@@ -41,7 +41,7 @@ public:
     bool number_float(Json::number_float_t value, const Json::string_t& source) {
         clear_value();
         if (!xgrammar::NumberSpellingPreserved(source, value))
-            result_.inexact_numbers.push_back(pointer());
+            result_.inexact_numbers.insert(pointer());
         advance();
         return dom_.number_float(value, source);
     }
@@ -57,7 +57,7 @@ public:
     }
 
     bool start_object(std::size_t size) {
-        clear_value();
+        enter();
         stack_.push_back({});
         return dom_.start_object(size);
     }
@@ -74,7 +74,7 @@ public:
     }
 
     bool start_array(std::size_t size) {
-        clear_value();
+        enter();
         stack_.push_back({.array = true});
         return dom_.start_array(size);
     }
@@ -108,16 +108,26 @@ private:
         if (!stack_.empty() && stack_.back().array) ++stack_.back().index;
     }
 
+    // A value replacing an earlier one at its pointer (a repeated object key) drops the numbers recorded there: the
+    // pointer itself and its subtree, the pointers in [path + '/', path + '0') ('0' follows '/'; keys escape '/').
+    // A range of the sorted set, not a scan of every recorded number for every scalar.
     void clear_value() {
-        if (result_.inexact_numbers.empty()) return;
+        auto& numbers = result_.inexact_numbers;
+        if (numbers.empty()) return;
         const auto path = pointer();
-        std::erase_if(result_.inexact_numbers,
-                      [&](const auto& old) { return old == path || old.starts_with(path + '/'); });
+        numbers.erase(path);
+        numbers.erase(numbers.lower_bound(path + '/'), numbers.lower_bound(path + '0'));
     }
 
     void scalar() {
         clear_value();
         advance();
+    }
+
+    // Thrown, not refused through the SAX result: the parse ignores it and would keep a partial DOM.
+    void enter() {
+        if (stack_.size() == kMaxJsonNesting) { throw JsonNestingError(); }
+        clear_value();
     }
 
     ParsedJsonNumbers& result_;
@@ -127,10 +137,10 @@ private:
     std::vector<Frame> stack_;
 };
 
-std::optional<std::string> find(const Json& node, const std::string& path,
-                                const std::vector<std::string>& inexact, bool literal = false) {
+std::optional<std::string> find(const Json& node, const std::string& path, const std::set<std::string>& inexact,
+                                bool literal = false) {
     if (node.is_number()) {
-        if (std::find(inexact.begin(), inexact.end(), path) != inexact.end()) return path;
+        if (inexact.contains(path)) return path;
         return {};
     }
     if (literal) {
@@ -170,6 +180,29 @@ ParsedJsonNumbers parse_json_numbers(std::string_view source) {
     NumberSax sax(parsed);
     Json::sax_parse(source, &sax);
     return parsed;
+}
+
+std::size_t json_text_nesting(std::string_view text) noexcept {
+    std::size_t depth = 0, deepest = 0;
+    bool quoted = false, escaped = false;
+    for (const char c : text) {
+        if (quoted) {
+            if (escaped) {
+                escaped = false;
+            } else if (c == '\\') {
+                escaped = true;
+            } else if (c == '"') {
+                quoted = false;
+            }
+        } else if (c == '"') {
+            quoted = true;
+        } else if (c == '[' || c == '{') {
+            deepest = std::max(deepest, ++depth);
+        } else if ((c == ']' || c == '}') && depth > 0) {
+            --depth;
+        }
+    }
+    return deepest;
 }
 
 std::optional<std::string> inexact_schema_number(const ParsedJsonNumbers& parsed,

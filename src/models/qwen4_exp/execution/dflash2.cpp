@@ -224,7 +224,8 @@ void DFlash2::propose(const DFlash2ProposalCall& call) {
             }
             ops::rmsnorm_rope(positions, layer.query_norm, layer.key_norm, p_.rope, q, k, s);
             ops::sliding_window_attention(q, k, v, positions, call.valid_columns, call.slots, {D, Hq, Hk},
-                                          config_.window, scale, ring_[l], envelope, work_, attention, s);
+                                          config_.window, ops::SlidingWindowMask::Symmetric, scale, ring_[l], envelope,
+                                          work_, attention, s);
             {
                 auto scratch_scope = work_.scope();
                 WorkspaceArena scratch(work_.alloc_bytes(

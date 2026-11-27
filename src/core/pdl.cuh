@@ -46,6 +46,11 @@ launch_dependent(const LaunchConfig& launch, void (*kernel)(KernelArgs...), Call
     return status == cudaStreamCaptureStatusActive;
 }
 
+template <class... KernelArgs>
+[[nodiscard]] inline bool graph_dependent(cudaStream_t stream, void (*)(KernelArgs...)) noexcept {
+    return graph_dependent(stream);
+}
+
 // Launches a kernel that implements the consumer protocol below (enter() before touching anything
 // but its immutable weights). Captured launches become programmatic dependents; eager launches are
 // ordinary stream-ordered launches.

@@ -87,15 +87,16 @@ void run_sliced(const Tensor& normalized, const Tensor& base, const Weight& proj
 template <int Hidden>
 void launch_hidden_sliced(const Tensor& normalized, const Tensor& base, const Weight& projection,
                           Tensor& prepared, Tensor& finish, cudaStream_t stream) {
-    const int columns = normalized.ne[1] * normalized.ne[2];
+    const int columns  = normalized.ne[1] * normalized.ne[2];
+    constexpr int Wide = Hidden % 512 == 0 ? 16 : 8;
     if (columns <= 8)
-        return run_sliced<Hidden, 8, 16, 32>(normalized, base, projection, prepared, finish, stream);
+        return run_sliced<Hidden, 8, Wide, 32>(normalized, base, projection, prepared, finish, stream);
     if (columns <= 16)
-        return run_sliced<Hidden, 16, 16, 32>(normalized, base, projection, prepared, finish,
-                                              stream);
+        return run_sliced<Hidden, 16, Wide, 32>(normalized, base, projection, prepared, finish,
+                                                stream);
     if (columns <= 32)
-        return run_sliced<Hidden, 32, 16, 32>(normalized, base, projection, prepared, finish,
-                                              stream);
+        return run_sliced<Hidden, 32, Wide, 32>(normalized, base, projection, prepared, finish,
+                                                stream);
     if (columns <= 64)
         return run_sliced<Hidden, 64, 8, 32>(normalized, base, projection, prepared, finish, stream);
     throw std::logic_error("dynamic grouped conv prepare: sliced route requires columns <= 64");
@@ -115,6 +116,8 @@ void bf16_dynamic_grouped_conv_prepare_fused_sliced_launch(const Tensor& normali
         return launch_hidden_sliced<2560>(normalized, base, projection, prepared, finish, stream);
     case 3072:
         return launch_hidden_sliced<3072>(normalized, base, projection, prepared, finish, stream);
+    case 2304:
+        return launch_hidden_sliced<2304>(normalized, base, projection, prepared, finish, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }

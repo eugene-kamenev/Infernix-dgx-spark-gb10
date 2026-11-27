@@ -17,13 +17,18 @@
 namespace infernix::ops {
 namespace {
 
-// The registered context widths: Qwen3.8-27B's DFlash2 (5120), Qwen3.8-Flash-Next's (2560) and
-// Qwen3.5-122B-A10B's (3072).
-bool registered_hidden(std::int32_t hidden) { return hidden == 5120 || hidden == 2560 || hidden == 3072; }
+// The registered context widths: Qwen3.8-27B's DFlash2 (5120), Qwen3.8-Flash-Next's (2560),
+// Qwen3.5-122B-A10B's (3072) and Inkling 2 Mini's (2304).
+bool registered_hidden(std::int32_t hidden) {
+    return hidden == 5120 || hidden == 2560 || hidden == 3072 || hidden == 2304;
+}
 constexpr std::int32_t kKVSize     = 1024;
 constexpr std::int32_t kHeadDim    = 128;
 constexpr std::int32_t kKVHeads    = 8;
 constexpr std::int32_t kCapacity   = 2048;
+bool registered_capacity(std::uint32_t capacity) {
+    return capacity == 2048 || capacity == 4096 || capacity == 8192;
+}
 // The widest multi-request append: every row of an ngram copy round of 63 drafts.
 constexpr std::int32_t kBatchedWidth = 64;
 constexpr const char* kOp          = "context_kv_materialize";
@@ -94,10 +99,11 @@ std::size_t key_scratch_capacity(std::int32_t columns, std::int32_t layers) {
 
 void validate_cache(const CyclicKVCacheLayerView& cache, std::int32_t padded,
                     std::int32_t lane_capacity) {
-    if (cache.capacity != kCapacity ||
+    if (!registered_capacity(cache.capacity) ||
         cache.padded_capacity != static_cast<std::uint32_t>(padded) ||
         cache.num_kv_heads != kKVHeads || cache.head_dim != kHeadDim ||
-        cache.lane_capacity != lane_capacity || padded < kCapacity || lane_capacity <= 0) {
+        cache.lane_capacity != lane_capacity || padded < static_cast<std::int32_t>(cache.capacity) ||
+        lane_capacity <= 0) {
         throw std::invalid_argument("context_kv_materialize: invalid cyclic cache geometry");
     }
     require_tensor(cache.k, DType::BF16, kHeadDim, padded, kKVHeads, lane_capacity, 16, "cache K");
@@ -134,7 +140,7 @@ void context_kv_materialize(
     const std::int32_t width  = context.ne[1];
     const std::int32_t batch  = context.ne[2];
     if (!registered_hidden(hidden)) {
-        throw std::invalid_argument("context_kv_materialize: H must be 5120, 2560 or 3072");
+        throw std::invalid_argument("context_kv_materialize: H must be 5120, 2560, 3072 or 2304");
     }
     if (!(rope_theta > 1.0F) || !std::isfinite(rope_theta)) {
         throw std::invalid_argument("context_kv_materialize: theta must be finite and above 1");
@@ -165,6 +171,9 @@ void context_kv_materialize(
         require_weight(layer.value_weight, hidden, "value weight");
         require_tensor(layer.key_norm_weight, DType::BF16, kHeadDim, 1, 1, 1, 4, "key norm weight");
         validate_cache(layer.cache, padded, lane_capacity);
+        if (layer.cache.capacity != layers.front().cache.capacity) {
+            throw std::invalid_argument("context_kv_materialize: every layer's ring has one capacity");
+        }
     }
 
     if (envelope.max_count == 0) return;

@@ -1,5 +1,6 @@
 #include "serve/serve_options.h"
 #include "product/config/config_file.h"
+#include "product/kv_window_options.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
 
@@ -31,6 +32,8 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--port"},
     ServeOptionArity{"--api-key"},
     ServeOptionArity{"--model-id"},
+    ServeOptionArity{"--lora"},
+    ServeOptionArity{"--ablate"},
     ServeOptionArity{"--ngram-volume"},
     ServeOptionArity{"--ngram-residency"},
     ServeOptionArity{"--ngram-cache-mib"},
@@ -54,7 +57,10 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--lossless", false},
     ServeOptionArity{"--fast-path", true, true},
     ServeOptionArity{"--expert-a4-activations", false},
+    ServeOptionArity{"--a16-activations", false},
     ServeOptionArity{"--a8-activations", false},
+    ServeOptionArity{"--q8-weights", false},
+    ServeOptionArity{"--w4-weights", false},
     ServeOptionArity{"--embedding-host", false},
     ServeOptionArity{"--context-cost-presets"},
     ServeOptionArity{"--log-stats-interval-ms"},
@@ -87,6 +93,7 @@ constexpr std::array kServeOptionArities{
     ServeOptionArity{"--expert-ram-layout"},
     ServeOptionArity{"--expert-pin-mib"},
     ServeOptionArity{"--kv-dtype"},
+    ServeOptionArity{"--kv-window-dtype"},
     ServeOptionArity{"--logits-dtype"},
     ServeOptionArity{"--spec"},
     ServeOptionArity{"--draft-tokens"},
@@ -230,6 +237,7 @@ std::size_t parse_host_context_mib(const char* text) {
 KvCacheStorage parse_kv_dtype(const char* text) {
     const std::string value(text);
     if (value == "bf16") { return KvCacheStorage::BFloat16; }
+    if (value == "bf16p") { return KvCacheStorage::Bf16Packed; }
     if (value == "int8") { return KvCacheStorage::Int8Group64; }
     if (value == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (value == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
@@ -713,6 +721,10 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             if (options.model_id_override->empty()) {
                 throw std::invalid_argument("--model-id must not be empty");
             }
+        } else if (arg == "--lora") {
+            options.lora_path = require_value("--lora");
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = require_value("--ablate");
         } else if (arg == "--ngram-volume") {
             options.ngram_volume_path = require_value("--ngram-volume");
         } else if (arg == "--ngram-residency") {
@@ -787,8 +799,14 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a16-activations") {
+            options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
+        } else if (arg == "--w4-weights") {
+            options.w4_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--context-cost-presets") {
@@ -989,6 +1007,8 @@ ServeOptions parse_serve_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_dtype(require_value("--kv-dtype"));
+        } else if (arg == "--kv-window-dtype") {
+            options.kv_window_cache = product::parse_kv_window_dtype(require_value("--kv-window-dtype"));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(require_value("--logits-dtype"));
         } else if (arg == "--spec") {

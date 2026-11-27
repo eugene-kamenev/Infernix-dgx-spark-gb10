@@ -36,6 +36,7 @@ enum class PendingRowFailure : std::uint8_t {
     // the row's tokens are placeholders. The Program withdraws the prefix-cache entries the
     // request published (hybrid-prefix-cache-spec §7.8): its state may be non-finite too.
     NonFiniteLogits,
+    UnpackableKv,
 };
 
 namespace testing {
@@ -75,6 +76,7 @@ public:
     [[nodiscard]] virtual TokenId branch_tool_token(std::size_t /*row*/) const noexcept {
         return -1;
     }
+    [[nodiscard]] virtual ReasoningBan reasoning_ban(std::size_t /*row*/) const noexcept { return {}; }
     // Returns dead-end position bits. Even dead/unreachable positions receive a safe nonempty
     // device mask. A dead end fails a row only if verification reaches that position.
     [[nodiscard]] virtual std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,

@@ -4,6 +4,24 @@
 
 namespace infernix::ops {
 
+template <int Value>
+struct StaticCount {
+    __host__ __device__ constexpr operator int() const { return Value; }
+};
+
+template <int Max, class Body>
+__device__ __forceinline__ void with_static_count(int count, Body&& body) {
+    if constexpr (Max == 1) {
+        body(StaticCount<1>{});
+    } else {
+        if (count >= Max) {
+            body(StaticCount<Max>{});
+        } else {
+            with_static_count<Max - 1>(count, body);
+        }
+    }
+}
+
 __device__ __forceinline__ void ldmatrix_x2(unsigned& r0, unsigned& r1, unsigned addr) {
     asm volatile("ldmatrix.sync.aligned.m8n8.x2.shared.b16 {%0,%1}, [%2];\n"
                  : "=r"(r0), "=r"(r1)

@@ -3,7 +3,10 @@
 #include <cstddef>
 #include <cstdint>
 #include <optional>
+#include <span>
 #include <string>
+#include <string_view>
+#include <vector>
 
 namespace infernix {
 
@@ -11,6 +14,12 @@ namespace infernix {
 // (Windows ullAvailPhys, Linux MemAvailable). Callers that lock large Host blocks check it first,
 // since pinned pages cannot be paged out and an oversized lock pushes other processes to swap.
 [[nodiscard]] std::uint64_t available_host_memory_bytes();
+
+// Copies `bytes` from `source` to `destination` with streaming (non-temporal) stores where the CPU has them (x86-64,
+// both pointers 16-byte aligned and `bytes` a multiple of 16; memcpy otherwise), visible to other threads on return.
+// For large background copies (the RAM tiers' moves and record fills): they then neither evict what the threads
+// serving requests keep in the caches nor read each destination line first, so they take less memory bandwidth.
+void copy_streaming(void* destination, const void* source, std::size_t bytes) noexcept;
 
 // One reading of the Host memory a startup ledger plans against.
 struct HostMemorySnapshot {
@@ -27,18 +36,14 @@ struct HostMemorySnapshot {
 };
 
 [[nodiscard]] HostMemorySnapshot host_memory_snapshot();
-
-// The part of the physical pool an allocation can obtain even though it is not free now: file cache
-// and reclaimable slabs the OS can evict. Linux: MemAvailable less MemFree (the kernel's own
-// estimate, already net of its low watermarks), lowered to what the process's cgroup still allows;
-// HugeTLB pages sit outside both readings and stay excluded because they are not reclaimable. Swap
-// is never included -- paged-out bytes are not device-speed memory. 0 on Windows, where
-// ullAvailPhys already counts what Windows reclaims.
-//
-// This is why a unified-memory GPU's driver reports less than the machine holds: on GB10
-// cudaMemGetInfo's free memory equals MemFree while tens of GiB of file cache sit in the same
-// LPDDR5x, and allocations past it succeed by evicting that cache.
 [[nodiscard]] std::uint64_t reclaimable_pool_bytes();
+
+// Whether this process runs inside a WSL2 virtual machine (Linux: the kernel release names Microsoft; false
+// elsewhere). Every reading above is then the VM's memory, not the Windows host's: the VM grows into the host's
+// RAM as the process page-locks it, and the host cannot take page-locked guest memory back.
+[[nodiscard]] bool host_is_wsl() noexcept;
+// The test of host_is_wsl on a kernel release string (/proc/sys/kernel/osrelease).
+[[nodiscard]] bool kernel_release_is_wsl(std::string_view release) noexcept;
 
 // Keeps at least `bytes` of this process resident (Windows: a hard minimum working set), so a small
 // RAM reserve trims other programs before Infernix's own pageable memory. Empty on success and where
@@ -64,18 +69,41 @@ public:
     // Writes one byte of every page of [begin, end) that nothing has written yet, so its first
     // touch (the zeroing) happens here; it must not overlap bytes already filled.
     void prefault(std::size_t begin, std::size_t end) const noexcept;
-    // Page-locks and maps the block for the device; once.
-    void pin();
-    // Attempts to register and map the block for integrated-UMA zero-copy without throwing.
-    // Returns nullptr when integrated UMA is unavailable or registration fails.
+    // Page-locks and maps the block for the device; once. One registration of the whole block; when
+    // the driver refuses it and `boundaries` (ascending offsets inside the block where an object
+    // begins) are given, slices of at most kSliceBytes that end only at those offsets, each mapped
+    // on its own (Basalt #73/#82: a Windows host refused 39.5 GiB whole and pinned it in slices).
+    // Throws when a slice is refused too. `slice_bytes` is for tests.
+    static constexpr std::size_t kSliceBytes = std::size_t{4} << 30;
+    void pin(std::span<const std::size_t> boundaries = {}, std::size_t slice_bytes = kSliceBytes);
+    // Where the device reaches byte `offset` (null before pin()). Contiguous within a slice, so an
+    // object that begins at one of pin()'s boundaries reads from here to its end.
+    [[nodiscard]] std::byte* device_at(std::size_t offset) const noexcept;
+    [[nodiscard]] std::byte* device_data() const noexcept { return device_at(0); }
     [[nodiscard]] void* try_pin_if_integrated_uma() noexcept;
-    [[nodiscard]] std::byte* device_data() const noexcept { return device_; } // null before pin()
+    // Registrations the block took: 1 whole, more in slices, 0 before pin().
+    [[nodiscard]] std::size_t registrations() const noexcept { return slices_.size(); }
 
 private:
-    std::byte* data_   = nullptr;
-    std::size_t size_  = 0;
-    std::byte* device_ = nullptr;
+    struct Slice {
+        std::size_t begin  = 0;
+        std::size_t bytes  = 0;
+        std::byte* device = nullptr;
+    };
+    // Registers [begin, begin + bytes) and appends it to slices_; false when the driver refuses it.
+    bool register_slice(std::size_t begin, std::size_t bytes, std::string& failure);
+    void unregister() noexcept;
+
+    std::byte* data_  = nullptr;
+    std::size_t size_ = 0;
+    std::vector<Slice> slices_;
 };
+
+namespace testing {
+// Makes RegisteredHostBuffer::pin refuse every registration larger than `bytes` (0: none), as a
+// driver that will not page-lock one large block would (sliced-pinning tests).
+void refuse_host_registrations_above(std::size_t bytes);
+} // namespace testing
 
 // Host memory kept in RAM for the CPU without page-locking it for the device: on Windows the
 // process's hard minimum working set grows by its size and its pages are VirtualLock'ed; on Linux
@@ -94,17 +122,44 @@ public:
     [[nodiscard]] std::size_t size() const noexcept { return size_; }
     // Empty when every page is locked in RAM; otherwise the OS's reason.
     [[nodiscard]] const std::string& lock_failure() const noexcept { return lock_failure_; }
-    // Attempts to map the buffer into the current CUDA device's UMA address space (zero-copy).
-    // Returns nullptr if unified addressing is unavailable or registration fails.
+    // Gives the pages of [offset, offset + bytes) (page-aligned, committed) back to the OS: unlocked and decommitted
+    // (Linux: dropped), and the hard minimum working set lowered by their size. Their bytes are lost; recommit them
+    // before touching them again.
+    void decommit(std::size_t offset, std::size_t bytes) noexcept;
+    // Commits a decommitted range again (zeroed) and locks it as the constructor does; false when the OS refuses the
+    // commit (the range stays decommitted). A refused lock leaves the pages pageable (lock_failure()).
+    [[nodiscard]] bool recommit(std::size_t offset, std::size_t bytes);
     void* map_for_device();
     [[nodiscard]] void* device_pointer() const noexcept { return device_; }
 
 private:
-    std::byte* data_    = nullptr;
-    void* device_       = nullptr;
-    std::size_t size_   = 0;
+    std::byte* data_  = nullptr;
+    void* device_     = nullptr;
+    std::size_t size_ = 0;
     std::size_t raised_ = 0; // Windows: what the minimum working set grew by
+    // Windows: of raised_, what decommitted pages left in the minimum because it could not be lowered for them; their
+    // recommit raises by that much less.
+    std::size_t not_lowered_ = 0;
     std::string lock_failure_;
+};
+
+// A range of this process's address space reserved with no memory behind it: nothing is committed
+// and any access faults. A plan-only materialization (artifact::materialize_geometry) binds weights
+// at addresses inside one, so their views have the shape and offsets a load gives them while no
+// byte is read, uploaded or pinned. Zero bytes reserves nothing (data() is null).
+class AddressReservation {
+public:
+    explicit AddressReservation(std::size_t bytes);
+    ~AddressReservation();
+    AddressReservation(const AddressReservation&)            = delete;
+    AddressReservation& operator=(const AddressReservation&) = delete;
+
+    [[nodiscard]] std::byte* data() const noexcept { return data_; }
+    [[nodiscard]] std::size_t size() const noexcept { return size_; }
+
+private:
+    std::byte* data_  = nullptr;
+    std::size_t size_ = 0;
 };
 
 } // namespace infernix

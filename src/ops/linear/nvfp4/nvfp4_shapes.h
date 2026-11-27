@@ -56,4 +56,7 @@ extern const Nvfp4LinearShape kNvfp4N10240K2560;
 extern const Nvfp4LinearShape kNvfp4N2560K2560;
 extern const Nvfp4LinearShape kNvfp4N1280K2560;
 extern const Nvfp4LinearShape kNvfp4N2560K640;
+// Inkling 2 Mini DFlash2 drafter (block_scale_k16_m128x4_v1, A16Only).
+extern const Nvfp4LinearShape kNvfp4N13824K2304;
+extern const Nvfp4LinearShape kNvfp4N2304K6912;
 } // namespace infernix::ops::detail

@@ -151,6 +151,35 @@ std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::st
     return out;
 }
 
+std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature,
+                                     const cudaDeviceProp& device) {
+    std::string out = hybrid_cache_fingerprint(options, signature);
+    std::error_code error;
+    const auto stamp = [](const std::filesystem::path& file) {
+        std::error_code e;
+        const auto bytes = std::filesystem::file_size(file, e);
+        const auto when  = std::filesystem::last_write_time(file, e);
+        return std::filesystem::absolute(file).string() + ":" + std::to_string(e ? 0U : bytes) + ":" +
+               std::to_string(e ? 0 : when.time_since_epoch().count());
+    };
+    if (!options.lora_path.empty()) {
+        const std::filesystem::path weights = std::filesystem::is_directory(options.lora_path, error)
+                                                  ? options.lora_path / "adapter_model.safetensors"
+                                                  : options.lora_path;
+        const std::filesystem::path config = weights.parent_path() / "adapter_config.json";
+        out += ";lora=" + stamp(weights) + "|" + stamp(config);
+    }
+    if (!options.ablate_sidecar_path.empty()) {
+        out += ";ablate=" + stamp(options.ablate_sidecar_path) + "|" +
+               stamp(std::filesystem::path(options.ablate_sidecar_path).replace_extension(".directions"));
+    }
+    if (options.expert_tail_skip != 0) { out += ";tail_skip=" + std::to_string(options.expert_tail_skip); }
+    for (const FastPath path : options.fast_path_exclusions) { out += std::string(",-") + fast_path_name(path); }
+    out += ";device=" + std::string(device.name) + ";cc=" + std::to_string(device.major) + "." +
+           std::to_string(device.minor) + ";sm=" + std::to_string(device.multiProcessorCount);
+    return out;
+}
+
 namespace {
 
 std::size_t current_free_device_bytes() {

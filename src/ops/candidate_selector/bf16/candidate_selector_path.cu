@@ -25,6 +25,8 @@ struct DeviceArgs {
     float* q;
     int steps;
     float* confidence; // [K, B] or null: the selected rank's temperature-1 softmax
+    float softcap = 0; // > 0: each edge becomes softcap * tanh(edge / softcap) (a softcap after the correction)
+    bool couple_draws = false; // the drafts are verified by equality with sample()'s draws (couple_mode)
 };
 
 struct alignas(16) SelectorShared {
@@ -34,14 +36,61 @@ struct alignas(16) SelectorShared {
     int predecessor, base_position;
     float temperature;
     unsigned long long seed;
+    int couple;
 };
+
+// How a sampled row's draws couple with its verification's draws: not at all (the proposal's own uniform), or as a
+// gumbel_max row's (coupled_rank). On a call whose drafts are verified by equality with sample()'s own draws
+// (`draws`, candidate_selector_path's couple_draws), a full-vocabulary row (SamplingConfig::full_vocabulary with a
+// positive temperature, sampling_full) draws as coupled_full_rank does, taking precedence as in sample(). A greedy
+// row draws the argmax whatever its mode.
+enum Couple : int { kUncoupled = 0, kCoupledGumbel = 1, kCoupledFull = 2 };
+
+__device__ __forceinline__ int couple_mode(const SamplingConfig& c, bool draws) {
+    if (draws && sampling_full(c)) { return kCoupledFull; }
+    return c.gumbel_max ? kCoupledGumbel : kUncoupled;
+}
+
+// A Gumbel-max row's coupled draw (candidates ZH-01): the available rank maximizing
+// sampling_gumbel_score(probability, seed, position, token), the score the row's verification gives
+// that token at the column whose output it is compared with (`position` = that column's produced
+// position: base + step + 1 for draft `step` of a round with frontier `base`). The draft is then the
+// target's own draw whenever the drafter ranks that token high, instead of only when it is the drafter's
+// likeliest. It is a draw from the law (Gumbel-max over its support; over the ranks left, a draw
+// without replacement), so the drafts' distribution is unchanged; the target keeps its own draw.
+// Ties go to the lower rank (the higher-probability one).
+__device__ __forceinline__ int coupled_rank(float probability, bool available, int token, unsigned long long seed,
+                                            int position) {
+    const float score = available && probability > 0.0F ? sampling_gumbel_score(probability, seed, position, token)
+                                                         : -CUDART_INF_F;
+    const float best  = warp_max(score);
+    const unsigned winners = __ballot_sync(kFullWarpMask, available && probability > 0.0F && score == best);
+    return winners == 0 ? -1 : __ffs(winners) - 1;
+}
+
+// A full-vocabulary row's coupled draw: the available rank maximizing edge / temperature +
+// sampling_full_noise(seed, position, token), the key the row's verification (sample() over the whole vocabulary,
+// sampling_full_score) gives that token at the column whose output it is compared with, `position` as
+// coupled_rank's. The edges stand for the target's logits there, so the draft is the target's own draw whenever that
+// token is a candidate and the edges order it as the logits do; it is the Gumbel-max draw of softmax(edge /
+// temperature), the proposal law q, so the drafts' distribution is unchanged. Ties go to the lower rank.
+__device__ __forceinline__ int coupled_full_rank(float edge, float temperature, bool available, int token,
+                                                 unsigned long long seed, int position) {
+    const float score =
+        available ? __fadd_rn(__fdiv_rn(edge, temperature), sampling_full_noise(seed, position, token)) : -CUDART_INF_F;
+    const float best       = warp_max(score);
+    const unsigned winners = __ballot_sync(kFullWarpMask, available && score == best);
+    return winners == 0 ? -1 : __ffs(winners) - 1;
+}
 
 // The probabilities written here are the same FP32 values consumed by the draw. Draft `step` of a
 // round at base position `base` draws with (seed, base + step, DFlash2Proposal, step): the step keeps
 // a later round, whose drafts at the same position have smaller steps, from meeting the uniform again
-// (block verification reads every draft of its round), as sampled MTP drafts' `draw` does.
+// (block verification reads every draft of its round), as sampled MTP drafts' `draw` does. A coupled
+// row's draw (`couple`, couple_mode) is coupled_rank's or coupled_full_rank's at base + step + 1 over the
+// lanes' `token`s.
 __device__ int draw_rank(float edge, float temperature, unsigned long long seed, int base, int step,
-                         float* q) {
+                         float* q, int couple = kUncoupled, int token = 0) {
     const int position = base + step;
     const int lane      = threadIdx.x & 31;
     const float maximum = warp_max(edge);
@@ -55,6 +104,14 @@ __device__ int draw_rank(float edge, float temperature, unsigned long long seed,
     const float weight      = lane < kCandidates ? __expf((edge - maximum) / temperature) : 0.0F;
     const float probability = weight / warp_sum(weight);
     if (lane < kCandidates) q[lane] = probability;
+    if (couple == kCoupledFull) {
+        const int selected = coupled_full_rank(edge, temperature, lane < kCandidates, token, seed, position + 1);
+        return selected < 0 ? 0 : selected;
+    }
+    if (couple == kCoupledGumbel) {
+        const int selected = coupled_rank(probability, lane < kCandidates, token, seed, position + 1);
+        return selected < 0 ? 0 : selected;
+    }
     float uniform =
         lane == 0 ? sampling_uniform(seed, position, kSamplePurposeDFlash2Proposal, static_cast<unsigned>(step))
                   : 0.0F;
@@ -102,7 +159,10 @@ __device__ void score_row(const DeviceArgs& a, int column, SelectorShared& share
         for (int r = lane; r < kRank; r += 32)
             sum = fmaf(shared.product[r], __bfloat162float(shared.successors[c * kRank + r]), sum);
         sum = warp_reduce_sum(sum);
-        if (lane == 0) shared.edge[c] = a.unary[column * kCandidates + c] + sum;
+        if (lane == 0) {
+            const float edge = a.unary[column * kCandidates + c] + sum;
+            shared.edge[c]   = a.softcap > 0.0F ? a.softcap * tanhf(edge / a.softcap) : edge;
+        }
     }
     __syncthreads();
 }
@@ -116,6 +176,7 @@ __global__ __launch_bounds__(512, 1) void selector_walk_kernel(DeviceArgs a) {
         shared.base_position = a.positions[batch];
         shared.temperature   = a.configs[batch].temperature;
         shared.seed          = a.configs[batch].seed;
+        shared.couple        = couple_mode(a.configs[batch], a.couple_draws);
     }
 #pragma unroll 1
     for (int step = 0; step < a.steps; ++step) {
@@ -123,8 +184,9 @@ __global__ __launch_bounds__(512, 1) void selector_walk_kernel(DeviceArgs a) {
         score_row(a, column, shared);
         if (warp == 0) {
             const float edge   = lane < kCandidates ? shared.edge[lane] : -CUDART_INF_F;
+            const int token    = lane < kCandidates ? a.ids[column * kCandidates + lane] : 0;
             const int selected = draw_rank(edge, shared.temperature, shared.seed, shared.base_position, step,
-                                           a.q + column * kCandidates);
+                                           a.q + column * kCandidates, shared.couple, token);
             if (a.confidence != nullptr) { write_confidence(edge, selected, a.confidence + column); }
             if (lane == 0) {
                 shared.predecessor = a.ids[column * kCandidates + selected];
@@ -154,6 +216,7 @@ __global__ __launch_bounds__(32) void selector_lattice_walk_kernel(DeviceArgs a,
     const int lane = threadIdx.x, batch = blockIdx.x;
     const auto seed         = a.configs[batch].seed;
     const float temperature = a.configs[batch].temperature;
+    const int couple        = couple_mode(a.configs[batch], a.couple_draws);
     const int position      = a.positions[batch];
     int predecessor_rank    = 0;
 #pragma unroll 1
@@ -165,7 +228,8 @@ __global__ __launch_bounds__(32) void selector_lattice_walk_kernel(DeviceArgs a,
                             kCandidates +
                         lane]
                 : -CUDART_INF_F;
-        int selected = draw_rank(edge, temperature, seed, position, step, a.q + column * kCandidates);
+        const int token = lane < kCandidates ? a.ids[column * kCandidates + lane] : 0;
+        int selected = draw_rank(edge, temperature, seed, position, step, a.q + column * kCandidates, couple, token);
         if (a.confidence != nullptr) { write_confidence(edge, selected, a.confidence + column); }
         predecessor_rank = selected;
         if (lane == 0) a.drafts[column] = a.ids[column * kCandidates + selected];
@@ -223,15 +287,24 @@ __device__ __forceinline__ float next_child_expectation(float law, unsigned take
 }
 
 // Without-replacement draw of a node's next child from its law restricted to the untaken ranks.
-// Greedy rows take the lowest untaken rank attaining the untaken edge maximum.
+// Greedy rows take the lowest untaken rank attaining the untaken edge maximum. A coupled row (`couple`,
+// gumbel_max) takes the untaken rank of the highest Gumbel score at the column's produced position
+// (position + 1): its children are the law's Gumbel top ranks in order, a draw without replacement.
 __device__ __forceinline__ int draw_untaken(float edge, float law, unsigned taken, bool greedy,
-                                            unsigned long long seed, int position, unsigned index) {
+                                            unsigned long long seed, int position, unsigned index,
+                                            bool couple = false, int token = 0) {
     const int lane       = threadIdx.x & 31;
     const bool available = lane < kCandidates && ((taken >> lane) & 1U) == 0U;
     if (greedy) {
         const float maximum    = warp_max(available ? edge : -CUDART_INF_F);
         const unsigned winners = __ballot_sync(kFullWarpMask, available && edge == maximum);
         return winners == 0 ? 0 : __ffs(winners) - 1;
+    }
+    if (couple) {
+        const int selected = coupled_rank(law, available, token, seed, position + 1);
+        if (selected >= 0) { return selected; }
+        const unsigned any = __ballot_sync(kFullWarpMask, available);
+        return any ? __ffs(any) - 1 : 0;
     }
     const float remaining = available ? law : 0.0F;
     const float mass      = warp_sum(remaining);
@@ -310,7 +383,10 @@ __global__ __launch_bounds__(32) void selector_tree_build_kernel(TreeArgs a, con
     const bool greedy         = !(temperature > 0.0F);
     const int position        = a.positions[row];
     const bool tree_row       = a.extents[row] == drafts;
-    const bool transport      = a.transport && !greedy && tree_row;
+    // A coupled row (gumbel_max) is verified by equality with the target's own draw, so it builds no
+    // transport shape: its children are its law's Gumbel top ranks.
+    const bool couple         = !greedy && a.configs[row].gumbel_max;
+    const bool transport      = a.transport && !greedy && !couple && tree_row;
     // A transport row's shape takes each node's best untaken rank, as a greedy row's does.
     const bool shape_greedy   = greedy || transport;
     const std::int64_t q_base = static_cast<std::int64_t>(row) * drafts;
@@ -344,7 +420,9 @@ __global__ __launch_bounds__(32) void selector_tree_build_kernel(TreeArgs a, con
         if (transport) {
             selected = draw_untaken(edge, p, 0U, true, seed, position + step, 0U); // published below
         } else {
-            selected = draw_rank(edge, temperature, seed, position, step, a.q + (q_base + column - 1) * kCandidates);
+            const int token = lane < kCandidates ? a.ids[(row * k + step) * kCandidates + lane] : 0;
+            selected = draw_rank(edge, temperature, seed, position, step, a.q + (q_base + column - 1) * kCandidates,
+                                 couple ? kCoupledGumbel : kUncoupled, token);
             publish_column(column, step, selected, nullptr);
         }
         __syncwarp();
@@ -389,8 +467,9 @@ __global__ __launch_bounds__(32) void selector_tree_build_kernel(TreeArgs a, con
             const float p    = lane < kCandidates ? law[from][lane] : 0.0F;
             const unsigned id =
                 (static_cast<unsigned>(from + 1) << 5) | static_cast<unsigned>(index);
+            const int token = lane < kCandidates ? a.ids[(row * k + step) * kCandidates + lane] : 0;
             const int selected =
-                draw_untaken(edge, p, taken[from], shape_greedy, seed, position + step, id);
+                draw_untaken(edge, p, taken[from], shape_greedy, seed, position + step, id, couple, token);
             if (!transport) { publish_column(column, step, selected, greedy ? nullptr : law[from]); }
             if (greedy && lane < kCandidates) {
                 a.q[(q_base + column - 1) * kCandidates + lane] = lane == selected ? 1.0F : 0.0F;
@@ -785,7 +864,8 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                                     const Tensor& successor_codebook, const Tensor& base_positions,
                                     const SamplingConfig* configs, Tensor& drafts,
                                     Tensor& proposal_q, Tensor* confidence,
-                                    const SelectorWorkspace& workspace, cudaStream_t stream) {
+                                    const SelectorWorkspace& workspace, float edge_softcap, bool couple_draws,
+                                    cudaStream_t stream) {
     const DeviceArgs args{static_cast<const std::int32_t*>(candidate_ids.data),
                           static_cast<const float*>(unary_scores.data),
                           static_cast<const __nv_bfloat16*>(projected_hidden.data),
@@ -797,7 +877,9 @@ void candidate_selector_path_launch(SelectorRoute route, const Tensor& candidate
                           static_cast<std::int32_t*>(drafts.data),
                           static_cast<float*>(proposal_q.data),
                           candidate_ids.ne[1],
-                          confidence != nullptr ? static_cast<float*>(confidence->data) : nullptr};
+                          confidence != nullptr ? static_cast<float*>(confidence->data) : nullptr,
+                          edge_softcap,
+                          couple_draws};
     if (route == SelectorRoute::Direct) {
         CUDA_CHECK(pdl::launch_consumer({dim3(candidate_ids.ne[2]), dim3(512), 0, stream},
                                         selector_walk_kernel, args));

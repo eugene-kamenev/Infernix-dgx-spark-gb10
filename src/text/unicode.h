@@ -49,6 +49,8 @@ std::vector<CodepointSpan> utf8_codepoints(std::string_view text, std::string_vi
 std::string codepoint_to_utf8(std::int32_t codepoint);
 
 bool is_letter(std::int32_t codepoint) noexcept;
+bool is_cased_upper_or_other_letter_or_mark(std::int32_t codepoint) noexcept;
+bool is_cased_lower_or_other_letter_or_mark(std::int32_t codepoint) noexcept;
 bool is_mark(std::int32_t codepoint) noexcept;
 bool is_number(std::int32_t codepoint) noexcept;
 // General category Nd only (the decimal digits of every script).

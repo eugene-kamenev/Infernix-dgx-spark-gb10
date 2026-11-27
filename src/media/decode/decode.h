@@ -34,6 +34,10 @@ struct Policy {
     std::uint64_t max_decoded_video_pixels = 128ULL * 1024ULL * 1024ULL;
     int max_video_source_frames            = 100'000;
     double max_video_duration_seconds      = 600.0;
+    // decode_image: also return the alpha plane of an image that carries transparency (an alpha channel, or PNG
+    // tRNS), for a processor that composites it itself (Inkling 2's checkerboard). Without it alpha is dropped and
+    // the colour samples stay as stored (Pillow's convert("RGB")).
+    bool keep_alpha = false;
     std::function<void()> checkpoint;
 };
 
@@ -41,6 +45,8 @@ struct Image {
     int width  = 0;
     int height = 0;
     std::vector<std::uint8_t> rgb;
+    // Policy::keep_alpha and a source with transparency: [height][width] alpha (255 opaque); otherwise empty.
+    std::vector<std::uint8_t> alpha;
 };
 
 struct ImageInfo {
@@ -77,6 +83,15 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
                         double target_fps, int min_frames, int max_frames);
 
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy);
+
+// Uncompressed RGB in Infernix's own container, for an image a caller renders itself (a PDF page): the 8 bytes
+// "IFXRGB24", the width and the height (32-bit little-endian), then width * height * 3 bytes, row-major.
+// inspect_image and decode_image read it as they read PNG or JPEG, without a codec.
+inline constexpr std::size_t kRawRgbHeaderBytes = 16;
+[[nodiscard]] std::vector<std::uint8_t> encode_raw_rgb(int width, int height, std::span<const std::uint8_t> rgb);
+// Whether this build's FFmpeg decodes animated WebP (FFmpeg 8: libavcodec 62+). Without it inspect_image and
+// decode_image refuse an animated WebP as InvalidInput with a message naming the version it needs.
+[[nodiscard]] bool animated_webp_supported() noexcept;
 Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, double target_fps,
                    int min_frames, int max_frames);
 

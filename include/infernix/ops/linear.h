@@ -37,6 +37,7 @@ enum class LinearPolicy : std::uint8_t {
     /// A projection that does not register a residual route runs A16 (the FP8 input projections
     /// and gate/up register one; the output and down projections do not).
     AllowA8Residual,
+    A8Only,
 };
 
 /**
@@ -110,8 +111,11 @@ enum class LinearRoutes : std::uint16_t {
 [[nodiscard]] constexpr bool valid_linear_policy(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::A16Only || policy == LinearPolicy::AllowA8 ||
            policy == LinearPolicy::AllowA4 || policy == LinearPolicy::A16ColumnInvariant ||
-           policy == LinearPolicy::AllowA4Residual || policy == LinearPolicy::AllowA8Residual;
+           policy == LinearPolicy::AllowA4Residual || policy == LinearPolicy::AllowA8Residual ||
+           policy == LinearPolicy::A8Only;
 }
+
+[[nodiscard]] constexpr bool a8_only(LinearPolicy policy) noexcept { return policy == LinearPolicy::A8Only; }
 
 [[nodiscard]] constexpr bool allows_a4_residual(LinearPolicy policy) noexcept {
     return policy == LinearPolicy::AllowA4Residual;

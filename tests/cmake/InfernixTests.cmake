@@ -27,6 +27,11 @@ function(infernix_op_oracle_options target)
       $<$<COMPILE_LANGUAGE:CXX>:-fno-fast-math>
       $<$<COMPILE_LANGUAGE:CXX>:-ffp-contract=off>)
   endif()
+  if(CMAKE_CUDA_HOST_COMPILER_ID MATCHES "GNU|Clang" OR CMAKE_CXX_COMPILER_ID MATCHES "GNU|Clang")
+    target_compile_options(${target} PRIVATE
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-fno-fast-math>
+      $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=-ffp-contract=off>)
+  endif()
 endfunction()
 
 function(infernix_add_op_test name)

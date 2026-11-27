@@ -138,6 +138,7 @@ public:
     DeviceKVPageHandle() noexcept = default;
 
     [[nodiscard]] bool valid() const noexcept { return owner_ != nullptr; }
+    [[nodiscard]] bool operator==(const DeviceKVPageHandle&) const noexcept = default;
 
 private:
     friend class DeviceKVPagePool;

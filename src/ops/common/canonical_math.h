@@ -299,6 +299,254 @@ INFERNIX_CANON_HD std::uint16_t swiglu_bf16(std::uint16_t gate_bf16, std::uint16
     return f32_to_bf16_rn(mul_rn(silu_c(bf16_to_f32(gate_bf16)), bf16_to_f32(up_bf16)));
 }
 
+INFERNIX_CANON_HD float expm1_c(float x) {
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
+    if (x > 88.72283935546875F) { return f32_from_bits(0x7F800000U); }
+    if (x < -88.0F) { return -1.0F; }
+    const float n  = rint_rn(mul_rn(x, 1.44269502162933349609375F));
+    const float r0 = fma_rn(-n, 0.693145751953125F, x);
+    const float r  = fma_rn(-n, 1.428606765330187045e-06F, r0);
+    float p        = 1.0F / 362880.0F;
+    p              = fma_rn(p, r, 1.0F / 40320.0F);
+    p              = fma_rn(p, r, 1.0F / 5040.0F);
+    p              = fma_rn(p, r, 1.0F / 720.0F);
+    p              = fma_rn(p, r, 1.0F / 120.0F);
+    p              = fma_rn(p, r, 1.0F / 24.0F);
+    p              = fma_rn(p, r, 1.0F / 6.0F);
+    p              = fma_rn(p, r, 0.5F);
+    const float q  = fma_rn(mul_rn(p, r), r, r);
+    const int k    = static_cast<int>(n);
+    if (k == 0) { return q; }
+    const int k1   = k / 2;
+    const float s1 = f32_from_bits(static_cast<std::uint32_t>(k1 + 127) << 23);
+    const float s2 = f32_from_bits(static_cast<std::uint32_t>(k - k1 + 127) << 23);
+    if (k > 64) {
+        return mul_rn(mul_rn(add_rn(1.0F, q), s1), s2);
+    }
+    const float scale = mul_rn(s1, s2);
+    return add_rn(mul_rn(q, scale), add_rn(scale, -1.0F));
+}
+
+INFERNIX_CANON_HD float tanh_c(float x) {
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
+    const std::uint32_t sign = f32_bits(x) & 0x80000000U;
+    const float a            = f32_from_bits(f32_bits(x) & 0x7FFFFFFFU);
+    float t;
+    if (a >= 9.0F) {
+        t = 1.0F;
+    } else if (a < 0.6F) {
+        const float s = mul_rn(a, a);
+        float p       = -0x1.967e18p-14F;
+        p             = fma_rn(p, s, 0x1.f57d78p-13F);
+        p             = fma_rn(p, s, -0x1.355824p-11F);
+        p             = fma_rn(p, s, 0x1.7da364p-10F);
+        p             = fma_rn(p, s, -0x1.d6d3d0p-9F);
+        p             = fma_rn(p, s, 0x1.226e36p-7F);
+        p             = fma_rn(p, s, -0x1.664f48p-6F);
+        p             = fma_rn(p, s, 0x1.ba1ba2p-5F);
+        p             = fma_rn(p, s, -0x1.111112p-3F);
+        p             = fma_rn(p, s, 0x1.555556p-2F);
+        t             = fma_rn(mul_rn(a, s), -p, a);
+    } else {
+        const float e = expm1_c(mul_rn(2.0F, a));
+        t             = div_rn(e, add_rn(e, 2.0F));
+    }
+    return f32_from_bits(f32_bits(t) | sign);
+}
+
+INFERNIX_CANON_HD float sigmoid_c(float x) {
+    if (x != x) { return f32_from_bits(kCanonicalNan); }
+    if (x >= 0.0F) { return div_rn(1.0F, add_rn(1.0F, exp_c(-x))); }
+    const float e = exp_c(x);
+    return div_rn(e, add_rn(1.0F, e));
+}
+
+INFERNIX_CANON_HD float log_c(float x) {
+    if (x != x || x < 0.0F) { return f32_from_bits(kCanonicalNan); }
+    if (x == 0.0F) { return f32_from_bits(0xFF800000U); }
+    if (f32_bits(x) == 0x7F800000U) { return x; }
+    std::uint32_t bits = f32_bits(x);
+    int k              = 0;
+    if (bits < 0x00800000U) {
+        bits = f32_bits(mul_rn(x, 33554432.0F));
+        k    = -25;
+    }
+    k += static_cast<int>(bits >> 23) - 127;
+    float m = f32_from_bits((bits & 0x007FFFFFU) | 0x3F800000U);
+    if (m > 1.41421353816986083984375F) {
+        m = mul_rn(m, 0.5F);
+        ++k;
+    }
+    const float f  = add_rn(m, -1.0F);
+    const float s  = div_rn(f, add_rn(2.0F, f));
+    const float s2 = mul_rn(s, s);
+    float p        = 1.0F / 13.0F;
+    p              = fma_rn(p, s2, 1.0F / 11.0F);
+    p              = fma_rn(p, s2, 1.0F / 9.0F);
+    p              = fma_rn(p, s2, 1.0F / 7.0F);
+    p              = fma_rn(p, s2, 1.0F / 5.0F);
+    p              = fma_rn(p, s2, 1.0F / 3.0F);
+    const float s3 = mul_rn(s, s2);
+    const float l  = fma_rn(mul_rn(2.0F, s3), p, mul_rn(2.0F, s));
+    const float kf = static_cast<float>(k);
+    return add_rn(mul_rn(kf, 0.693145751953125F), fma_rn(kf, 1.428606765330187045e-06F, l));
+}
+
+INFERNIX_CANON_HD float softcap_c(float x, float cap) {
+    const float r = mul_rn(cap, tanh_c(div_rn(x, cap)));
+    return r != r ? f32_from_bits(kCanonicalNan) : r;
+}
+
+struct FourOverSixRow {
+    float enc   = 0;
+    float dec   = 0;
+    float outer = 0;
+};
+
+INFERNIX_CANON_HD FourOverSixRow four_over_six_row(float amax) {
+    constexpr float kFp32Max = 3.4028234663852886e38F;
+    FourOverSixRow out;
+    const float enc = div_rn(1536.0F, amax);
+    out.enc         = enc < kFp32Max ? enc : kFp32Max;
+    out.dec         = div_rn(1.0F, out.enc);
+    out.outer       = mul_rn(amax, 1.0F / 1536.0F);
+    return out;
+}
+
+struct FourOverSixBlock {
+    std::uint8_t code[16];
+    std::uint8_t scale_word;
+};
+
+INFERNIX_CANON_HD float four_over_six_half(const float (&x)[8], std::uint8_t word, const FourOverSixRow& row,
+                                           std::uint8_t (&codes)[8]) {
+    constexpr float kFp32Max = 3.4028234663852886e38F;
+    const float s   = e4m3_value(word);
+    const float inv = div_rn(1.0F, mul_rn(s, row.dec));
+    const float k   = inv < kFp32Max ? inv : kFp32Max;
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 1000
+    float q[8];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) { q[j] = mul_rn(x[j], k); }
+    unsigned cword;
+    asm("{\n\t"
+        ".reg .b8 b0, b1, b2, b3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b0, %2, %1;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b1, %4, %3;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b2, %6, %5;\n\t"
+        "cvt.rn.satfinite.e2m1x2.f32 b3, %8, %7;\n\t"
+        "mov.b32 %0, {b0, b1, b2, b3};\n\t"
+        "}"
+        : "=r"(cword)
+        : "f"(q[0]), "f"(q[1]), "f"(q[2]), "f"(q[3]), "f"(q[4]), "f"(q[5]), "f"(q[6]), "f"(q[7]));
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 4; ++j) {
+        const unsigned byte = (cword >> (8 * j)) & 0xFFU;
+        codes[2 * j]        = static_cast<std::uint8_t>(byte & 0xFU);
+        codes[2 * j + 1]    = static_cast<std::uint8_t>(byte >> 4);
+    }
+    float err[8];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) {
+        const float c = mul_rn(0.5F, static_cast<float>(e2m1_x2(codes[j])));
+        const float d = add_rn(mul_rn(mul_rn(c, s), row.outer), -x[j]);
+        err[j]        = d < 0.0F ? -d : d;
+    }
+#else
+    float err[8];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) {
+        codes[j]      = e2m1_rn_satfinite(mul_rn(x[j], k));
+        const float c = mul_rn(0.5F, static_cast<float>(e2m1_x2(codes[j])));
+        const float d = add_rn(mul_rn(mul_rn(c, s), row.outer), -x[j]);
+        err[j]        = d < 0.0F ? -d : d;
+    }
+#endif
+    INFERNIX_CANON_UNROLL
+    for (int width = 4; width >= 1; width /= 2) {
+        INFERNIX_CANON_UNROLL
+        for (int j = 0; j < width; ++j) { err[j] = add_rn(err[2 * j], err[2 * j + 1]); }
+    }
+    return err[0];
+}
+
+struct FourOverSixWords {
+    std::uint8_t six, four;
+};
+INFERNIX_CANON_HD FourOverSixWords four_over_six_words(float bmax, const FourOverSixRow& row) {
+    const float v6 = mul_rn(bmax, mul_rn(row.enc, 1.0F / 6.0F));
+    const float v4 = mul_rn(bmax, mul_rn(row.enc, 0.25F));
+    return {e4m3_rn_satfinite(v6 < 448.0F ? v6 : 448.0F), e4m3_rn_satfinite(v4 < 448.0F ? v4 : 448.0F)};
+}
+
+struct Mxfp8Group {
+    std::uint8_t code[32];
+    std::uint8_t exponent;
+};
+
+INFERNIX_CANON_HD std::uint8_t e4m3_signed_rn(float x) {
+    const std::uint32_t sign = (f32_bits(x) >> 31) != 0 ? 0x80U : 0U;
+    return static_cast<std::uint8_t>(sign | e4m3_rn_satfinite(f32_from_bits(f32_bits(x) & 0x7FFFFFFFU)));
+}
+
+INFERNIX_CANON_HD std::uint32_t mxfp8_exponent(float amax, bool nan) {
+    const float raw = mul_rn(amax, 1.0F / 448.0F);
+    std::uint32_t e = ((f32_bits(raw) + 0x007FFFFFU) & 0x7F800000U) >> 23;
+    e               = raw <= 0x1p-127F ? 0U : (e < 254U ? e : 254U);
+    return nan ? 255U : e;
+}
+
+INFERNIX_CANON_HD std::uint8_t mxfp8_code(float x, std::uint32_t e) {
+    if (e == 255U) { return 0; }
+    const float scale   = e == 0U ? 0x1p-127F : f32_from_bits(e << 23);
+    const float inverse = e == 0U ? 0x1p127F : div_rn(1.0F, scale);
+    float v             = mul_rn(x, inverse);
+    v                   = v < -448.0F ? -448.0F : (v > 448.0F ? 448.0F : v);
+    return e4m3_signed_rn(v);
+}
+
+INFERNIX_CANON_HD Mxfp8Group mxfp8_group(const float (&x)[32]) {
+    Mxfp8Group out{};
+    float amax = 0.0F;
+    bool nan   = false;
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 32; ++j) {
+        nan           = nan || x[j] != x[j];
+        const float a = f32_from_bits(f32_bits(x[j]) & 0x7FFFFFFFU);
+        amax          = a > amax ? a : amax;
+    }
+    const std::uint32_t e = mxfp8_exponent(amax, nan);
+    out.exponent          = static_cast<std::uint8_t>(e);
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 32; ++j) { out.code[j] = mxfp8_code(x[j], e); }
+    return out;
+}
+
+INFERNIX_CANON_HD FourOverSixBlock four_over_six_block(const float (&x)[16], const FourOverSixRow& row) {
+    float bmax = 0.0F;
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 16; ++j) {
+        const float a = f32_from_bits(f32_bits(x[j]) & 0x7FFFFFFFU);
+        bmax          = a > bmax ? a : bmax;
+    }
+    const FourOverSixWords w = four_over_six_words(bmax, row);
+    float lo[8], hi[8];
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) { lo[j] = x[j], hi[j] = x[8 + j]; }
+    std::uint8_t c6[2][8], c4[2][8];
+    const float err6 = add_rn(four_over_six_half(lo, w.six, row, c6[0]), four_over_six_half(hi, w.six, row, c6[1]));
+    const float err4 = add_rn(four_over_six_half(lo, w.four, row, c4[0]), four_over_six_half(hi, w.four, row, c4[1]));
+    const bool four  = err4 < err6;
+    FourOverSixBlock out{};
+    INFERNIX_CANON_UNROLL
+    for (int j = 0; j < 8; ++j) {
+        out.code[j]     = four ? c4[0][j] : c6[0][j];
+        out.code[8 + j] = four ? c4[1][j] : c6[1][j];
+    }
+    out.scale_word = four ? w.four : w.six;
+    return out;
+}
+
 // ---------------------------------------------------------------------------- A4 codes
 
 // The A4 rule of quantize_a4_block split into its two steps and returning the 4-bit E2M1 code

@@ -1308,7 +1308,7 @@ OutputSession Frontend::make_output_session(const PreparedPrompt& prompt,
                                       ? std::optional<std::int32_t>(impl_->markers.reasoning_close)
                                       : std::nullopt,
                 .separator      = fi::kReasoningCloseSeparator,
-                .excluded_token = (prompt.data_->starts_in_reasoning && tool_constraint)
+                .withheld_token = (prompt.data_->starts_in_reasoning && tool_constraint)
                                       ? std::optional<std::int32_t>(impl_->markers.tool_call)
                                       : std::nullopt};
             if (tool_constraint) {

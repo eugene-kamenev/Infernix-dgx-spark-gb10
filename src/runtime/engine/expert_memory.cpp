@@ -1,6 +1,7 @@
 #include "runtime/engine/expert_memory.h"
 
 #include "core/host_memory.h"
+#include "infernix/ops/kernel_images.h"
 
 #include <algorithm>
 #include <cstdio>
@@ -26,6 +27,13 @@ void report_diagnostic(const DiagnosticObserver& observer, DiagnosticLevel level
 
 void report_engine(const EngineOptions& options, DiagnosticLevel level, const std::string& text) {
     report_diagnostic(options.diagnostic_observer, level, text);
+}
+
+void report_kernel_images(const EngineOptions& options, double seconds) {
+    if (seconds <= 0.0) { return; }
+    char line[128];
+    std::snprintf(line, sizeof(line), "CUDA kernel images: read in %.2f s beside the weights", seconds);
+    report_engine(options, DiagnosticLevel::Debug, line);
 }
 
 expert_offload::HostMemoryDemand expert_ram_demand(const EngineOptions& options, const ExpertPinnedTerms& pinned,
@@ -54,6 +62,93 @@ std::uint64_t ledger_left_bytes(const expert_offload::HostMemoryLedger& ledger) 
 std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept {
     constexpr std::uint64_t kCap = 8ULL << 30, kStep = 256ULL << 20;
     return std::max(kMinAutoHostContextBytes, std::min(kCap, left_bytes / 5 * 2) / kStep * kStep);
+}
+
+std::uint64_t frontend_cache_bytes(const EngineOptions& options) noexcept {
+    return options.grammar_cache_bytes + options.speculative.ngram_archive_bytes +
+           (options.enable_vision ? options.media_cache_bytes + options.media_live_bytes : 0U);
+}
+
+std::optional<std::uint64_t> ledger_pin_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept {
+    const expert_offload::HostMemoryDemand& demand = ledger.demand;
+    if (!demand.pin_room) { return std::nullopt; }
+    const std::uint64_t others = demand.other_pinned + demand.later_pinned + demand.prefix_cache;
+    const std::uint64_t pinned =
+        others + static_cast<std::uint64_t>(static_cast<double>(others) * demand.lock_overhead) + 1 + ledger.expert_pinned;
+    return *demand.pin_room > pinned ? *demand.pin_room - pinned : 0;
+}
+
+std::uint64_t auto_host_context_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept {
+    constexpr std::uint64_t kStep = 256ULL << 20;
+    const std::uint64_t used        = ledger.demand.reserve + ledger.planned + ledger.expert_ram;
+    const std::uint64_t commit_left = ledger.snapshot.available_commit > used ? ledger.snapshot.available_commit - used : 0;
+    std::uint64_t left              = std::min(ledger_left_bytes(ledger), commit_left);
+    if (const auto pin_left = ledger_pin_left_bytes(ledger)) { left = std::min(left, *pin_left); }
+    const auto bytes = static_cast<std::uint64_t>(static_cast<double>(left) / (1.0 + ledger.demand.lock_overhead));
+    return std::max(kMinAutoHostContextBytes, bytes / kStep * kStep);
+}
+
+std::uint64_t auto_host_context_ceiling_bytes(HostMemorySnapshot snapshot, const expert_offload::HostMemoryDemand& demand,
+                                              std::uint64_t startup) noexcept {
+    const std::uint64_t held   = snapshot.available_physical + snapshot.process_resident;
+    const std::uint64_t others = snapshot.total_physical > held ? snapshot.total_physical - held : 0;
+    snapshot.available_physical += others;
+    snapshot.available_commit += others;
+    return std::max(startup, auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand)));
+}
+
+AutoHostTier plan_auto_host_tier(const HostMemorySnapshot& snapshot, expert_offload::HostMemoryDemand demand) noexcept {
+    AutoHostTier out;
+    demand.prefix_cache = 0;
+    out.bytes           = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+    if (!demand.expert_cap) { return out; }
+    demand.prefix_cache = out.bytes;
+    if (!expert_offload::plan_host_memory(snapshot, demand).cap_too_large) { return out; }
+    demand.expert_cap.reset();
+    demand.prefix_cache = 0;
+    out.bytes           = auto_host_context_bytes(expert_offload::plan_host_memory(snapshot, demand));
+    out.keeps_cap       = false;
+    return out;
+}
+
+std::string expert_ram_refusal(const EngineOptions& options, const expert_offload::HostMemoryLedger& ledger) {
+    if (!ledger.cap_too_large) { return {}; }
+    return "--expert-ram-mib " + std::to_string(options.expert_ram_bytes.value_or(0) >> 20) +
+           " asks for more Host RAM than is free or pinnable now (" + ledger.describe() +
+           "); lower it, use auto, or free Host memory";
+}
+
+void reserve_expert_working_set(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand) {
+    if (const auto refused = reserve_process_working_set(demand.process_growth); !refused.empty()) {
+        report_engine(options, DiagnosticLevel::Warning,
+                      "Windows would not guarantee Infernix " + std::to_string(demand.process_growth >> 20) +
+                          " MiB of resident working memory (" + refused +
+                          "); everything still works, but if RAM runs short Windows may move some of it to the "
+                          "page file and responses slow down");
+    }
+}
+
+ExpertVramCheck size_expert_vram(const EngineOptions& options, const std::string& model, const VramSnapshot& before,
+                                 std::uint64_t fixed, std::uint32_t graphs, std::uint64_t frame_bytes,
+                                 std::uint32_t max_frames, const std::string& contributors) {
+    expert_offload::VramDemand demand;
+    demand.headroom    = options.vram_headroom_bytes;
+    demand.graphs      = graphs;
+    demand.fixed       = fixed;
+    demand.frame_bytes = frame_bytes;
+    demand.max_frames  = max_frames;
+    ExpertVramCheck out;
+    out.sizing = expert_offload::size_expert_frames(before, demand);
+    const auto& check = out.sizing;
+    if (check.frame_bytes < 0) {
+        out.refusal =
+            model + " does not fit in device memory: " + std::to_string(mib(before.device_free)) + " MiB free; " +
+            contributors + "; reserve " + std::to_string(mib(check.reserve)) + "; headroom " +
+            std::to_string(mib(check.headroom)) + " (" + check.describe() +
+            "). Lower --max-context, --max-concurrency or --prefill-chunk, use --kv-dtype int8, lower "
+            "--vram-headroom-mib, or free VRAM";
+    }
+    return out;
 }
 
 ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,

@@ -13,6 +13,7 @@
 #include "runtime/engine/diagnostics.h"
 #include "runtime/engine/scheduler.h"
 #include "runtime/engine/generation_budget.h"
+#include "runtime/engine/kv_capacity.h"
 #include "runtime/expert_offload/placement.h"
 
 #include <algorithm>
@@ -84,11 +85,36 @@ public:
         }
 
         ForbiddenToken forbidden_token(std::size_t row) const noexcept override {
-            return outputs[row] ? outputs[row]->forbidden_token() : ForbiddenToken{};
+            if constexpr (requires { outputs[row]->forbidden_token(); }) {
+                return outputs[row] ? outputs[row]->forbidden_token() : ForbiddenToken{};
+            } else {
+                return ForbiddenToken{};
+            }
         }
 
         TokenId branch_tool_token(std::size_t row) const noexcept override {
-            return outputs[row] ? outputs[row]->branch_tool_token() : -1;
+            if constexpr (requires { outputs[row]->branch_tool_token(); }) {
+                return outputs[row] ? outputs[row]->branch_tool_token() : -1;
+            } else {
+                return -1;
+            }
+        }
+
+        ReasoningBan reasoning_ban(std::size_t row) const noexcept override {
+            if constexpr (requires { outputs[row]->reasoning_ban(); }) {
+                return outputs[row] ? outputs[row]->reasoning_ban() : ReasoningBan{};
+            } else {
+                return ReasoningBan{};
+            }
+        }
+
+        bool needed(std::size_t row) const noexcept {
+            if (!outputs[row]) { return false; }
+            bool active = outputs[row]->constrained();
+            if constexpr (requires { outputs[row]->reasoning_ban(); }) {
+                active = active || outputs[row]->reasoning_ban().active();
+            }
+            return active;
         }
 
         std::uint64_t fill(std::size_t row, std::span<const TokenId> drafts,
@@ -103,7 +129,7 @@ public:
 
     EngineCore(Instance& instance, DeviceContext& device, const EngineOptions& options)
         : instance_(instance), device_(device), max_context_(options.max_context),
-          max_concurrency_(options.max_concurrency),
+          max_concurrency_(options.max_concurrency), decision_lanes_(options.decision_lanes),
           max_outstanding_(static_cast<std::size_t>(options.max_concurrency) +
                            options.max_pending_requests),
           pending_timeout_(std::chrono::milliseconds(options.pending_timeout_ms)),
@@ -117,12 +143,14 @@ public:
                                         std::chrono::milliseconds{0})
                                   : std::chrono::milliseconds{0}) {
         if (max_concurrency_ == 0 || max_concurrency_ > kMaximumConcurrency ||
-            options.max_pending_requests == 0 || pending_timeout_.count() <= 0) {
+            decision_lanes_ >= max_concurrency_ || options.max_pending_requests == 0 ||
+            pending_timeout_.count() <= 0) {
             throw std::invalid_argument("Engine core bounds are invalid");
         }
         paused_.reserve(max_outstanding_);
         scratch_hold_ids_.reserve(max_outstanding_);
         scratch_hold_bases_.reserve(max_outstanding_);
+        scratch_hold_resumes_.reserve(max_outstanding_);
         if (options.speculative.ngram_archive_bytes != 0) {
             ngram_archive_ = std::make_unique<NgramArchive>(typename NgramArchive::Limits{
                 .session_bytes = options.speculative.ngram_session_bytes,
@@ -208,6 +236,9 @@ public:
     static constexpr bool kProgramMaintains = requires(typename Instance::ModelContract::Program& program) {
         program.maintain();
         program.set_maintenance_waker(std::function<void()>{});
+    };
+    static constexpr bool kProgramMaintainsBusy = requires(typename Instance::ModelContract::Program& program) {
+        program.maintain_busy();
     };
     // A Program that names the logical CPUs of the round thread (Qwen3.5's offloaded experts:
     // runtime::expert_offload::CpuPlacement::engine, 0 for unpinned).
@@ -423,24 +454,17 @@ public:
 
     [[nodiscard]] MemorySummary memory_summary() const {
         std::scoped_lock lock(execution_mutex_);
-        MemorySummary out                      = instance_.program->memory_summary();
-        const KvCapacityResolution& resolution = instance_.kv_capacity_resolution;
-        out.kv_capacity_mode                   = resolution.mode;
-        out.kv_capacity_page_groups            = resolution.main_page_groups;
-        out.kv_capacity_max_page_groups        = resolution.maximum_main_page_groups;
-        out.minimum_runtime_reservation_bytes  = resolution.minimum_runtime_reservation_bytes;
-        out.kv_capacity_increment_bytes        = resolution.bytes_per_additional_main_page_group;
-        out.runtime_reservation_bytes          = resolution.runtime_reservation_bytes;
-        out.available_after_weights_bytes      = resolution.available_after_weights_bytes;
-        out.available_after_startup_bytes      = resolution.available_after_startup_bytes;
-        out.vram_headroom_bytes                = resolution.automatic_headroom_bytes;
-        out.planned_slack_bytes                = resolution.planned_slack_bytes;
-        return out;
+        return with_kv_capacity(instance_.program->memory_summary(), instance_.kv_capacity_resolution);
     }
 
     [[nodiscard]] RuntimeStats runtime_stats() const {
         std::lock_guard lock(stats_mutex_);
         return published_stats_;
+    }
+
+    [[nodiscard]] RequestMonitor request_monitor() const {
+        std::lock_guard lock(stats_mutex_);
+        return published_monitor_;
     }
 
     [[nodiscard]] bool is_available() const noexcept {
@@ -620,10 +644,12 @@ private:
         };
         std::optional<GenerationStart> start;
         std::optional<PromptProgress> progress;
+        std::optional<GenerationProgressObservation> position;
         std::vector<typename Request::StreamEvent> events;
         for (;;) {
             start.reset();
             progress.reset();
+            position.reset();
             events.clear();
             bool done = false;
             {
@@ -636,14 +662,21 @@ private:
                 request->stream_start.reset();
                 progress = std::move(request->stream_progress);
                 request->stream_progress.reset();
+                position = std::move(request->live_progress);
+                request->live_progress.reset();
                 events.swap(request->events);
                 done = request->response_done;
             }
 
-            if (caller_error == nullptr && sink != nullptr) {
+            if (caller_error == nullptr) {
                 try {
-                    if (start) { sink->start(std::move(*start)); }
-                    if (progress) { sink->progress(std::move(*progress)); }
+                    if (sink != nullptr) {
+                        if (start) { sink->start(std::move(*start)); }
+                        if (progress) { sink->progress(std::move(*progress)); }
+                    }
+                    if (position && request->observation.progress) {
+                        request->observation.progress(*position);
+                    }
                 } catch (...) { fail_consumer(); }
             }
             for (auto& event : events) {
@@ -868,11 +901,28 @@ private:
         request->cv.notify_one();
     }
 
+    void publish_progress_observation(const std::shared_ptr<Request>& request) {
+        if (!request->observation.progress || !request->admitted_begin) { return; }
+        const BeginSummary& begin = *request->admitted_begin;
+        const GenerationProgressObservation observation{
+            .engine_request_id       = request->id,
+            .prompt_tokens           = begin.prompt_tokens,
+            .reused_prompt_tokens    = begin.reused_prompt_tokens,
+            .processed_prompt_tokens = begin.reused_prompt_tokens + request->computed_prompt_tokens,
+            .generated_tokens        = static_cast<std::uint32_t>(std::min<std::size_t>(
+                request->generated.size(), std::numeric_limits<std::uint32_t>::max())),
+        };
+        std::lock_guard lock(request->mutex);
+        if (request->response_done) { return; }
+        request->live_progress = observation;
+    }
+
     void publish_generation_start(const std::shared_ptr<Request>& request, BeginSummary begin) {
         if (request->admitted_begin) {
             throw std::logic_error("request admission published generation start twice");
         }
         request->admitted_begin = begin;
+        publish_progress_observation(request);
         if (request->observation.phase_timings || request->observation.live_timings ||
             request->observation.prompt_progress) {
             if (!request->admitted_at) {
@@ -1508,6 +1558,17 @@ private:
                     remove_completed_slot(lane);
                     continue;
                 }
+                if (failures[row] == PendingRowFailure::UnpackableKv) {
+                    publish_diagnostic(diagnostics_, DiagnosticLevel::Error,
+                                       "a K or V row has no bf16p packed form: failed 1 request; "
+                                       "the Engine keeps serving");
+                    complete_error(request, std::make_exception_ptr(std::runtime_error(
+                                                "a K or V row of this request has more values outside "
+                                                "its exponent window than bf16p packing can store "
+                                                "exactly; the request was not completed")));
+                    remove_completed_slot(lane);
+                    continue;
+                }
                 if (refused[row]) {
                     std::string what = "unknown error";
                     try {
@@ -1577,7 +1638,8 @@ private:
     void
     resolve_prefill_progress(const std::shared_ptr<Request>& request,
                              typename ModelContract::PrefillProgress&& progress,
-                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+                             const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start,
+                             bool grouped = false) {
         EnginePhaseScope phase(*this, EngineHostPhase::CommitOutput);
         ++cumulative_stats_.host_work.prefill_units;
         ++request->host_timing.prefill_units;
@@ -1599,13 +1661,17 @@ private:
         if (progress.complete && request->computed_prompt_tokens != suffix_tokens) {
             throw std::logic_error("completed prefill did not reach the admitted prompt frontier");
         }
-        if (progress.processed_prompt_tokens != 0) { publish_prompt_progress(request); }
+        if (progress.processed_prompt_tokens != 0) {
+            request->last_progress = Clock::now();
+            publish_prompt_progress(request);
+            publish_progress_observation(request);
+        }
         // Between a long prompt's calls (Qwen4Exp: after each layer-walk span) the frames it borrows
         // can be returned, so a request waiting for KV growth need not wait for the whole prompt
         // (GitHub #24: admitted after the first 65,536-token span instead of expiring in the queue).
         if (progress.capacity_released) { request_admission_check(); }
         if (!progress.complete) { return; }
-        if (!request->lane || !progress.pending) {
+        if (!request->lane || grouped == progress.pending.has_value()) {
             throw std::logic_error("completed prefill has no lane or pending token");
         }
         if (!request->admitted_begin || progress.summary != *request->admitted_begin) {
@@ -1614,6 +1680,7 @@ private:
         const std::uint32_t lane = request->lane->value;
         request->begin           = progress.summary;
         request->readout         = std::move(progress.readout);
+        if (grouped) { return; }
         const std::array<std::uint32_t, 1> lanes{lane};
         phase.finish();
         commit_pending(std::move(*progress.pending), lanes, false, cancelled_at_unit_start);
@@ -1638,7 +1705,7 @@ private:
         setup.finish();
         RoundMasks masks;
         masks.outputs[0] = &request->output;
-        auto* provider   = request->output.constrained() ? &masks : nullptr;
+        auto* provider   = masks.needed(0) ? &masks : nullptr;
         ProgramCallScope program_call(*this);
         auto progress = instance_.program->advance_prefill(*request->sequence,
                                                            &program_call.failed_timing(), provider);
@@ -1650,6 +1717,80 @@ private:
         resolve_prefill_progress(request, std::move(progress), cancelled_at_unit_start);
         publish_runtime_stats();
         return complete;
+    }
+
+    static constexpr bool kPrefillGroups =
+        requires(typename ModelContract::Program& program, std::span<const SequenceHandle> s, const SequenceHandle& h) {
+            { program.prefill_joins(s, h) } -> std::same_as<bool>;
+            program.advance_prefill_group(s, nullptr, nullptr);
+        };
+
+    [[nodiscard]] bool prefill_groupable(std::uint32_t lane) const {
+        const auto& request = slots_[lane];
+        return request && request->sequence && request->is_prefilling() && !request->is_replaying() &&
+               !request->background && request->model_state != EngineRequestState::Pausing &&
+               !request->cancelled.load(std::memory_order_acquire) &&
+               !instance_.program->context_blocks(*request->sequence) && !request->output.constraint_pending();
+    }
+
+    void run_prefill_group(std::span<const std::uint32_t> lanes,
+                           const std::array<bool, kMaximumConcurrency>& cancelled_at_unit_start) {
+        if constexpr (kPrefillGroups) {
+            nvtx::ScopedRange prefill_range(nvtx::Name::Prefill, nvtx::Category::Prefill);
+            EnginePhaseScope setup(*this, EngineHostPhase::CommitOutput);
+            std::vector<std::shared_ptr<Request>> requests;
+            std::vector<SequenceHandle> sequences;
+            RoundMasks masks;
+            bool masked = false;
+            for (std::size_t row = 0; row < lanes.size(); ++row) {
+                const auto request = slots_[lanes[row]];
+                if (request == nullptr || !request->is_prefilling() || !request->sequence) {
+                    throw std::logic_error("staged prefill group lane has invalid request state");
+                }
+                requests.push_back(request);
+                sequences.push_back(*request->sequence);
+                masks.outputs[row] = &request->output;
+                masked             = masked || masks.needed(row);
+            }
+            setup.finish();
+            ProgramCallScope program_call(*this);
+            auto progress = instance_.program->advance_prefill_group(sequences, &program_call.failed_timing(),
+                                                                      masked ? &masks : nullptr);
+            program_call.finish(progress.timing);
+            try {
+                if (progress.lanes.size() != lanes.size()) {
+                    throw std::logic_error("prefill group progress has a row count other than its lanes'");
+                }
+                std::array<std::uint32_t, kMaximumConcurrency> completed{};
+                for (std::size_t i = 0; i < progress.completed.size(); ++i) {
+                    if (progress.completed[i] >= lanes.size() || !progress.lanes[progress.completed[i]].complete) {
+                        throw std::logic_error("prefill group names a completed row that did not complete");
+                    }
+                    completed[i] = lanes[progress.completed[i]];
+                }
+                for (std::size_t row = 0; row < lanes.size(); ++row) {
+                    if (!requests[row]->first_output_timing) {
+                        record_execution_work(requests[row]->prefill_work, progress.timing);
+                    }
+                    resolve_prefill_progress(requests[row], std::move(progress.lanes[row]), cancelled_at_unit_start, true);
+                }
+                if (progress.completed.empty() != !progress.pending) {
+                    throw std::logic_error("prefill group's pending batch disagrees with its completed rows");
+                }
+                if (progress.pending) {
+                    auto pending = std::move(*progress.pending);
+                    progress.pending.reset();
+                    commit_pending(std::move(pending),
+                                   std::span<const std::uint32_t>(completed.data(), progress.completed.size()),
+                                   false, cancelled_at_unit_start);
+                    request_admission_check();
+                }
+            } catch (...) {
+                if (progress.pending) { (void)instance_.program->abort_pending(std::move(*progress.pending)); }
+                throw;
+            }
+            publish_runtime_stats();
+        }
     }
 
     void ensure_base_plan(const std::shared_ptr<Request>& request) {
@@ -1881,12 +2022,14 @@ private:
         if (!queue_holds_ && tool_call_hold_.count() == 0) { return; }
         scratch_hold_ids_.clear();
         scratch_hold_bases_.clear();
+        scratch_hold_resumes_.clear();
         for (const auto& request : paused_) {
             if (!request->base_plan || request->cancelled.load(std::memory_order_acquire)) {
                 continue;
             }
             scratch_hold_ids_.push_back(request->id);
             scratch_hold_bases_.push_back(&*request->base_plan);
+            scratch_hold_resumes_.push_back(request->suspended ? &*request->suspended : nullptr);
         }
         {
             std::lock_guard lock(queue_mutex_);
@@ -1896,9 +2039,11 @@ private:
                 }
                 scratch_hold_ids_.push_back(request->id);
                 scratch_hold_bases_.push_back(&*request->base_plan);
+                scratch_hold_resumes_.push_back(nullptr);
             }
         }
-        resources_.hold_queue(*instance_.program, scratch_hold_ids_, scratch_hold_bases_);
+        resources_.hold_queue(*instance_.program, scratch_hold_ids_, scratch_hold_bases_,
+                              scratch_hold_resumes_);
     }
 
     // Fails a waiting (fresh or paused) request that admission can never serve, alone: as a worker
@@ -1953,7 +2098,8 @@ private:
                 ensure_base_plan(request);
                 std::vector<SourceCandidate> sources = resources_.candidates(
                     *instance_.program, *request->base_plan,
-                    restoring ? request->suspended->frontier() : UINT32_MAX);
+                    restoring ? request->suspended->frontier() : UINT32_MAX,
+                    restoring && request->suspended ? &*request->suspended : nullptr);
                 // An idle-time pass whose history the cache already holds ends before any binding
                 // (an agent turn that echoed the reply resumes from its endpoint anyway, §7.9).
                 if (request->background && !restoring && next_turn_covered(*request, sources)) {
@@ -2138,6 +2284,8 @@ private:
 
     void reserve_resident_units(ReservationScope scope = ReservationScope::Round) {
         runnable_units_.fill(false);
+        prefill_primary_.reset();
+        prefill_companions_.clear();
         std::optional<std::uint32_t> recovering;
         std::optional<std::uint32_t> oldest;
         for (std::uint32_t lane = 0; lane < max_concurrency_; ++lane) {
@@ -2254,6 +2402,24 @@ private:
                 runnable_units_[lane] = false;
             }
         }
+        if constexpr (kPrefillGroups) {
+            if (prefill && !recovering && !blocked && runnable_units_[*prefill] && prefill_groupable(*prefill)) {
+                std::vector<SequenceHandle> group{*slots_[*prefill]->sequence};
+                for (std::uint32_t offset = 1; offset < max_concurrency_; ++offset) {
+                    const std::uint32_t lane = (*prefill + offset) % max_concurrency_;
+                    if (!prefill_view[lane] || !prefill_groupable(lane) ||
+                        !instance_.program->prefill_joins(group, *slots_[lane]->sequence)) {
+                        continue;
+                    }
+                    const ExecutionUnit unit{*slots_[lane]->sequence, UnitKind::Prefill, 0U};
+                    if (!instance_.program->reserve_units({&unit, 1})) { continue; }
+                    runnable_units_[lane] = true;
+                    group.push_back(*slots_[lane]->sequence);
+                    prefill_companions_.push_back(lane);
+                }
+                if (!prefill_companions_.empty()) { prefill_primary_ = *prefill; }
+            }
+        }
     }
 
     void run_decode_round(const RoundMembership& membership,
@@ -2266,7 +2432,7 @@ private:
         bool constrained = false;
         for (std::size_t row = 0; row < membership.size; ++row) {
             masks.outputs[row] = &slots_[membership.lane_span()[row]]->output;
-            constrained |= masks.outputs[row]->constrained();
+            constrained |= masks.needed(row);
         }
         auto pending = instance_.program->decode(
             membership.sequence_span(), membership.budget_span(), &program_call.failed_timing(),
@@ -2741,7 +2907,21 @@ private:
                     return;
                 }
             }
+            const bool maintain_busy = [&] {
+                std::lock_guard lock(queue_mutex_);
+                return std::exchange(maintenance_requested_, false);
+            }();
             std::unique_lock execution_lock(execution_mutex_);
+            if constexpr (kProgramMaintainsBusy) {
+                if (maintain_busy) {
+                    try {
+                        instance_.program->maintain_busy();
+                    } catch (const std::exception& error) {
+                        publish_diagnostic(diagnostics_, DiagnosticLevel::Warning,
+                                           "RAM resize between rounds failed: %s", error.what());
+                    }
+                }
+            }
             bool executed   = false;
             worker_busy_at_ = Clock::now();
             try {
@@ -2883,7 +3063,24 @@ private:
                         prefill_slots[lane].reset();
                     }
                 }
-                const auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                auto lane = scheduler_.next_prefill(prefill_slots, max_concurrency_);
+                std::vector<std::uint32_t> group;
+                if constexpr (kPrefillGroups) {
+                    if (prefill_primary_ && prefill_slots[*prefill_primary_] &&
+                        prefill_groupable(*prefill_primary_)) {
+                        lane = prefill_primary_;
+                        group.push_back(*lane);
+                        std::vector<SequenceHandle> sequences{*slots_[*lane]->sequence};
+                        for (const std::uint32_t companion : prefill_companions_) {
+                            if (!prefill_slots[companion] || !prefill_groupable(companion) ||
+                                !instance_.program->prefill_joins(sequences, *slots_[companion]->sequence)) {
+                                continue;
+                            }
+                            group.push_back(companion);
+                            sequences.push_back(*slots_[companion]->sequence);
+                        }
+                    }
+                }
                 // A protected unit (Replay, a recovering request) never gives way to the decode
                 // share; any other waits while the share still owes Control/Decode time.
                 const bool shared_unit = lane && !slots_[*lane]->is_replaying() &&
@@ -2913,7 +3110,25 @@ private:
                         }
                     } else {
                         const auto prefill_started = Clock::now();
-                        const bool complete = run_prefill_step(*lane, snapshot_cancellations());
+                        bool complete              = false;
+                        if constexpr (kPrefillGroups) {
+                            if (group.size() > 1) {
+                                std::vector<std::shared_ptr<Request>> companions;
+                                for (std::size_t i = 1; i < group.size(); ++i) {
+                                    companions.push_back(slots_[group[i]]);
+                                }
+                                run_prefill_group(group, snapshot_cancellations());
+                                for (std::size_t i = 1; i < group.size(); ++i) {
+                                    scheduler_.prefill_executed(group[i], max_concurrency_);
+                                    update_recovery(companions[i - 1]);
+                                }
+                                complete = !request->is_prefilling();
+                            } else {
+                                complete = run_prefill_step(*lane, snapshot_cancellations());
+                            }
+                        } else {
+                            complete = run_prefill_step(*lane, snapshot_cancellations());
+                        }
                         cumulative_stats_.execution.prefill.add(
                             elapsed_ns(prefill_started, Clock::now()));
                         if (shared_unit) {
@@ -2963,6 +3178,7 @@ private:
     DeviceContext& device_;
     const std::uint32_t max_context_;
     const std::uint32_t max_concurrency_;
+    const std::uint32_t decision_lanes_ = 0;
     const std::size_t max_outstanding_;
     const std::chrono::milliseconds pending_timeout_;
     const bool queue_holds_;
@@ -2992,8 +3208,11 @@ private:
     std::vector<std::shared_ptr<Request>> paused_;
     std::vector<std::uint64_t> scratch_hold_ids_;
     std::vector<const typename ModelContract::RequestBasePlan*> scratch_hold_bases_;
+    std::vector<const typename ModelContract::ResumeState*> scratch_hold_resumes_;
     Scheduling scheduler_;
     std::array<bool, kMaximumConcurrency> runnable_units_{};
+    std::optional<std::uint32_t> prefill_primary_;
+    std::vector<std::uint32_t> prefill_companions_;
     std::array<std::uint32_t, kMaximumConcurrency> deferred_first_tokens_{};
     std::atomic<bool> admission_check_pending_{false};
     std::uint64_t worker_accounted_elapsed_ns_ = 0;
@@ -3002,6 +3221,7 @@ private:
     std::size_t current_decode_lane_count_ = 0;
     RuntimeStats cumulative_stats_;
     RuntimeStats published_stats_;
+    RequestMonitor published_monitor_;
     std::atomic<bool> stopping_{false};
     bool maintenance_requested_ = false; // guarded by queue_mutex_
     std::atomic<bool> failed_{false};

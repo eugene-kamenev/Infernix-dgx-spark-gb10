@@ -197,6 +197,8 @@ void bf16_dynamic_grouped_conv_prepare_fused_tma_launch(const Tensor& normalized
         return launch_hidden_tma<2560>(normalized, base, projection, prepared, finish, stream);
     case 3072:
         return launch_hidden_tma<3072>(normalized, base, projection, prepared, finish, stream);
+    case 2304:
+        return launch_hidden_tma<2304>(normalized, base, projection, prepared, finish, stream);
     }
     throw std::logic_error("dynamic grouped conv prepare: unregistered hidden width");
 }

@@ -222,8 +222,9 @@ int run_case(Cache& cache, int width, int batch, int base_context, int envelope_
     auto context = cache.view();
     DeviceContext device;
     const auto launch = [&] {
-        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, tlane, Geometry, cache.window, Scale,
-                                      context, envelope, workspace, to, device.stream);
+        ops::sliding_window_attention(tq, tk, tv, tp, tvalid, tlane, Geometry, cache.window,
+                                      ops::SlidingWindowMask::Symmetric, Scale, context, envelope,
+                                      workspace, to, device.stream);
     };
     DecodeGraphDefinition definition;
     DecodeGraphExecutable graph;

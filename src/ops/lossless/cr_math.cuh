@@ -294,6 +294,35 @@ __device__ inline float cr_softplus(float x) {
     return f32_of_dd(dd_softplus(x));
 }
 
+__device__ inline DD dd_tanh(float x) {
+    const double a = fabs(static_cast<double>(x));
+    const DD e     = dd_exp(2.0 * a);
+    const DD t     = dd_div(dd_add(e, {-1.0, 0.0}), dd_add(e, {1.0, 0.0}));
+    return x < 0.0F ? DD{-t.hi, -t.lo} : t;
+}
+
+__device__ inline float cr_tanh(float x) {
+    if (isnan(x)) { return x; }
+    const float a = fabsf(x);
+    if (a < 0x1p-13F) { return x; }
+    if (a > 9.1F) { return copysignf(1.0F, x); }
+    const double y = tanh(static_cast<double>(x));
+    float out;
+    if (certain_f32(y, fabs(y) * kDoubleErr, out)) { return out; }
+    return f32_of_dd(dd_tanh(x));
+}
+
+__device__ inline float cr_log(float x) {
+    if (isnan(x) || x < 0.0F) { return NAN; }
+    if (x == 0.0F) { return -INFINITY; }
+    if (isinf(x)) { return x; }
+    if (x == 1.0F) { return 0.0F; }
+    const double y = log(static_cast<double>(x));
+    float out;
+    if (certain_f32(y, fabs(y) * kDoubleErr, out)) { return out; }
+    return f32_of_dd(dd_log({static_cast<double>(x), 0.0}));
+}
+
 // ------------------------------------------------------------------------- cos and sin
 
 // cos(r) and sin(r) for |r| <= pi/4 + 2^-20 in double-double: Taylor to degree 28 / 27 (the remainder

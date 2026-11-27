@@ -44,6 +44,9 @@ void ggml_linear_a8(const Tensor& x, std::span<const GgmlSegment> segments, std:
 // The bytes ggml_linear_a8 allocates from its workspace for `columns` columns of K = k.
 [[nodiscard]] std::size_t a8_linear_workspace_bytes(std::int32_t k, std::int32_t columns, bool sums);
 
+[[nodiscard]] std::int32_t a8_linear_column_words(std::int32_t k, bool sums);
+void a8_encode_columns(const Tensor& x, Tensor& encoded, cudaStream_t stream);
+
 // The wide route (ggml_linear_a8_wide.cu), for a call of kA8WideMinColumns or more columns of K a multiple of 64
 // with ggml_linear's validated arguments: the segments' decoded planes (at most kA8WidePlaneBytes) and the encoded
 // columns of batches of up to kA8WideBatchColumns.

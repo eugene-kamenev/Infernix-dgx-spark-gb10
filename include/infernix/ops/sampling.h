@@ -65,6 +65,10 @@ struct SamplingConfig {
     // masked token and another valid alternative exists in the mask.
     std::int32_t branch_tool_token   = -1;
     std::uint32_t* branch_mask_words = nullptr;
+    bool full_vocabulary             = false;
+    std::int32_t reasoning_close     = -1;
+    std::int32_t reasoning_ends[2]   = {-1, -1};
+    std::int32_t reasoning_withheld  = -1;
 };
 
 // Caller-owned transient capacity for every parallel sampling-lane count in the inclusive
@@ -122,7 +126,10 @@ struct SamplingConfig {
  */
 void sample(const Tensor& logits, Tensor& out, std::int32_t token_domain,
             const SamplingConfig* configs, const Tensor& logical_positions, std::int32_t purpose,
-            WorkspaceArena& workspace, cudaStream_t stream);
+            WorkspaceArena& workspace, cudaStream_t stream, bool full_vocabulary_rows = false);
+
+void increment_licensed_token_counts(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                     const SamplingConfig* configs, cudaStream_t stream);
 
 /**
  * Filter active combined-branch grammar masks in place when the unconstrained penalty-adjusted

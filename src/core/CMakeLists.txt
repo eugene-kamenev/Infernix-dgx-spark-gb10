@@ -8,13 +8,19 @@ add_library(infernix_core STATIC
   evictable_weight_pool.cu
   vmm_arena.cu
   device.cu
+  content_hash.cpp
   direct_read_queue.cpp
+  direct_scratch_file.cpp
   dtype.cpp
   gpu_telemetry.cpp
   host_load.cpp
   host_memory.cpp
+  timer_resolution.cpp
+  host_memory_worker.cpp
   host_worker_pool.cpp
+  io_priority.cpp
   link_probe.cu
+  power_throttling.cpp
   temporary_switches.cpp
   vram_budget.cpp
   gdn_replay_records.cpp

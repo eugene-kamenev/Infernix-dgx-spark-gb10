@@ -13,10 +13,14 @@
 namespace infernix::product {
 
 [[nodiscard]] inline SpeculativeBackend parse_speculative_backend(std::string_view value) {
+    if (value == "off") { return SpeculativeBackend::None; }
     if (value == "mtp") { return SpeculativeBackend::Mtp; }
     if (value == "dflash") { return SpeculativeBackend::DFlash; }
     if (value == "dflash2") { return SpeculativeBackend::DFlash2; }
-    throw std::invalid_argument("invalid speculative backend: " + std::string(value));
+    if (value == "dspark") { return SpeculativeBackend::DSpark; }
+    if (value == "dspine") { return SpeculativeBackend::DSpine; }
+    throw std::invalid_argument("invalid speculative backend (auto, off, mtp, dflash, dflash2, dspark or dspine): " +
+                                std::string(value));
 }
 
 // Applies a --spec value: "auto" lets the Engine choose the drafter from the artifact (backend None
@@ -41,6 +45,10 @@ inline void apply_speculative_backend(SpeculativeOptions& options, std::string_v
         return "dflash";
     case SpeculativeBackend::DFlash2:
         return "dflash2";
+    case SpeculativeBackend::DSpark:
+        return "dspark";
+    case SpeculativeBackend::DSpine:
+        return "dspine";
     }
     return "unknown";
 }
@@ -195,8 +203,8 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         throw std::invalid_argument("--spec-min-p tunes one drafter's cut: --spec auto takes none");
     }
     if (options.draft_min_p && options.backend != SpeculativeBackend::Mtp &&
-        options.backend != SpeculativeBackend::DFlash2) {
-        throw std::invalid_argument("--spec-min-p requires --spec mtp or dflash2");
+        options.backend != SpeculativeBackend::DFlash2 && options.backend != SpeculativeBackend::DSpark) {
+        throw std::invalid_argument("--spec-min-p requires --spec mtp, dflash2 or dspark");
     }
     // auto with dflash or dflash2: the block drafters' per-round verify width.
     if (options.draft_tokens_auto && !speculation_requested(options)) {
@@ -236,6 +244,9 @@ inline void validate_speculative_cli_options(const SpeculativeOptions& options) 
         if (options.draft_tokens == 0 || options.draft_tokens > 15) {
             throw std::invalid_argument("--spec dflash2 requires --draft-tokens in [1,15] or auto");
         }
+        return;
+    case SpeculativeBackend::DSpark:
+    case SpeculativeBackend::DSpine:
         return;
     }
     throw std::invalid_argument("invalid speculative backend");

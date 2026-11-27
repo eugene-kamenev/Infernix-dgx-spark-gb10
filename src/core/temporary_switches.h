@@ -23,7 +23,9 @@ namespace infernix::temporary_switches {
 enum class Scope : std::uint8_t {
     Qwen3_5  = 1, // Qwen3_5ForCausalLM / Qwen3_5MoeForCausalLM Programs (and their kernels)
     Qwen4Exp = 2, // Qwen3.8-Flash-Next
-    All      = 3, // both (the Engine core, the shared expert offload stack)
+    All      = 3, // both Qwen families (the shared expert offload stack and what only they run)
+    Inkling2 = 4, // Inkling2LoopForCausalLM
+    Every    = 7, // every family (core code each Program runs, such as the decode graphs' builder)
 };
 
 // The raw value, or nullopt when unset or empty.
@@ -41,6 +43,8 @@ enum class Scope : std::uint8_t {
 
 // ---------------------------------------------------------------------------------------------
 // Switches with a structured value, parsed once here for every reader.
+
+[[nodiscard]] double continuing_prompt();
 
 // INFERNIX_TMP_GW_SHAPE=<rows>x<stages>: the groupwise sliced-K pipelined kernel's forced block rows
 // (16, 32 or 64) and ring stages (1-4) instead of choose_sliced_k_shape's (ops/linear/common/

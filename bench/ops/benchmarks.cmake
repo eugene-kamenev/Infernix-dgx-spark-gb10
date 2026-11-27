@@ -86,3 +86,4 @@ infernix_add_op_bench(infernix_context_kv_materialize_bench
   SOURCES "${CMAKE_CURRENT_LIST_DIR}/context_kv_materialize_bench.cu")
 infernix_add_op_bench(infernix_mtp_pack_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/mtp_pack_bench.cu")
 infernix_add_op_bench(infernix_proposal_remap_bench SOURCES "${CMAKE_CURRENT_LIST_DIR}/proposal_remap_bench.cu")
+infernix_add_op_bench(infernix_inkling2_sweep SOURCES "${CMAKE_CURRENT_LIST_DIR}/inkling2_sweep.cu")

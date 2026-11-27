@@ -27,12 +27,18 @@ struct LoadOptions {
     KvCacheStorage reference_kv = KvCacheStorage::BFloat16;
     // Qwen4Exp: routed expert banks whose 4-bit activations are optional run them (W4A4).
     bool expert_a4_activations = false;
+    bool expert_a16_activations = false;
+    bool a16_activations       = false;
+    bool a8_dense              = false;
     // Offloaded routed expert banks (Qwen4Exp, Qwen3.5 with offloaded experts) stay in the artifact
     // and are read in place by the SSD expert tier (Flash-Next design §19.3.7) instead of being
     // pinned in host memory.
     bool stream_experts = false;
+    bool expert_csf     = false;
     // Qwen4Exp DFlash2: the companion artifact of the drafter (SpeculativeOptions::draft_model).
     std::filesystem::path draft_model;
+    std::filesystem::path lora;
+    std::filesystem::path ablate;
     // Qwen4Exp: the artifact's 2-bit screens (--screen-heads), each bound when present for its consumer (an
     // artifact without them loads as before): the MTP drafter's proposal head (Generation with --spec mtp
     // --lm-head-draft) and the LM head (Generation with fast paths, where screened-lm-head may be selected).
@@ -55,6 +61,10 @@ struct LoadOptions {
     // copies), nothing has to be streamed or staged, and the kernel reads records straight from
     // their final home.
     bool device_experts = false;
+    bool pack_bf16      = false;
+    bool hc_q8_repack   = false;
+    bool q8_weights     = false;
+    bool w4_weights     = false;
 
     bool operator==(const LoadOptions&) const = default;
 
@@ -74,7 +84,9 @@ struct LoadOptions {
         return speculative == SpeculativeBackend::DFlash2;
     }
 
-    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2(); }
+    [[nodiscard]] bool dspine() const noexcept { return speculative == SpeculativeBackend::DSpine; }
+
+    [[nodiscard]] bool masked_draft() const noexcept { return dflash() || dflash2() || dspine(); }
 
     [[nodiscard]] bool proposal_enabled() const noexcept {
         return purpose == EnginePurpose::Generation && speculative != SpeculativeBackend::None &&
@@ -91,13 +103,22 @@ struct LoadOptions {
             return "dflash";
         case SpeculativeBackend::DFlash2:
             return "dflash2";
+        case SpeculativeBackend::DSpark:
+            return "dspark";
+        case SpeculativeBackend::DSpine:
+            return "dspine";
         }
         return {};
     }
 };
 
 [[nodiscard]] constexpr bool is_masked_draft_backend(SpeculativeBackend backend) noexcept {
-    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2;
+    return backend == SpeculativeBackend::DFlash || backend == SpeculativeBackend::DFlash2 ||
+           backend == SpeculativeBackend::DSpine;
+}
+
+[[nodiscard]] constexpr bool is_sparse_draft_backend(SpeculativeBackend backend) noexcept {
+    return backend == SpeculativeBackend::DFlash2 || backend == SpeculativeBackend::DSpine;
 }
 
 // --vision-offload auto: on for Qwen4Exp, whose expert cache lends the encode window's device
@@ -118,7 +139,13 @@ struct LoadOptions {
             .reference                = options.reference,
             .reference_kv             = options.reference ? options.kv_cache : KvCacheStorage::BFloat16,
             .expert_a4_activations    = options.expert_a4_activations,
+            .expert_a16_activations   = architecture == Architecture::Qwen4Exp &&
+                                      (options.expert_a16_activations || options.a8_activations),
+            .a16_activations          = architecture != Architecture::Qwen4Exp && options.expert_a16_activations,
+            .expert_csf               = options.expert_csf,
             .draft_model              = options.speculative.draft_model,
+            .lora                     = options.lora_path,
+            .ablate                   = options.ablate_sidecar_path,
             // The screens are Qwen4Exp's (a Qwen3.5 Program compares these options with its loaded ones).
             .proposal_head_screen     = architecture == Architecture::Qwen4Exp &&
                                     options.purpose == EnginePurpose::Generation &&
@@ -134,7 +161,15 @@ struct LoadOptions {
             // verification decides alone (the fast route, and the reproducible route, whose verification is
             // width-invariant and sampling Gumbel-max). No speculation is lossless.
             .mtp_expert_pool = !options.lossless && options.purpose == EnginePurpose::Generation &&
-                               options.speculative.backend == SpeculativeBackend::Mtp};
+                               options.speculative.backend == SpeculativeBackend::Mtp,
+            .pack_bf16 = (architecture == Architecture::Qwen4Exp || architecture == Architecture::Inkling2Loop) &&
+                         !options.lossless,
+            .hc_q8_repack    = architecture == Architecture::Qwen4Exp && options.a8_activations && !options.lossless &&
+                            options.fast_paths,
+            .q8_weights = architecture == Architecture::Inkling2Loop && options.q8_weights && !options.lossless &&
+                          options.fast_paths,
+            .w4_weights = architecture == Architecture::Inkling2Loop && options.w4_weights && !options.lossless &&
+                          options.fast_paths};
 }
 
 } // namespace infernix::models

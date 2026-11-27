@@ -16,6 +16,15 @@ struct ResolvedExecutionOptions {
     ThinkingControlOptions thinking;
     std::vector<TokenId> readout_tokens;
     TokenConstraint constraint;
+    bool background       = false;
+    bool publish_endpoint = true;
+};
+
+struct ReasoningBan {
+    TokenId close    = -1;
+    TokenId ends[2]  = {-1, -1};
+    TokenId withheld = -1;
+    [[nodiscard]] bool active() const noexcept { return close >= 0; }
 };
 
 struct ResolvedRequestOptions {
@@ -25,6 +34,7 @@ struct ResolvedRequestOptions {
     StopPolicy stop;
     OutputOptions output;
     NgramSessionHints ngram_session;
+    bool decision = false;
 };
 
 enum class ContinuationAction : std::uint8_t {
@@ -60,6 +70,7 @@ struct RequestPlanSummary {
     std::uint32_t effective_output_tokens = 0;
     FinishReason effective_limit_reason   = FinishReason::None;
     bool publish_continuation             = true;
+    bool publish_endpoint                 = true;
 };
 
 } // namespace infernix::runtime

@@ -11,6 +11,7 @@
 #include "runtime/expert_offload/memory_plan.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace infernix::runtime {
@@ -61,6 +62,19 @@ struct ExpertRamPlan {
 // its snapshots there, so it always has a tier).
 inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
 [[nodiscard]] std::uint64_t auto_host_context_bytes(std::uint64_t left_bytes) noexcept;
+[[nodiscard]] std::uint64_t frontend_cache_bytes(const EngineOptions& options) noexcept;
+[[nodiscard]] std::optional<std::uint64_t> ledger_pin_left_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
+[[nodiscard]] std::uint64_t auto_host_context_bytes(const expert_offload::HostMemoryLedger& ledger) noexcept;
+[[nodiscard]] std::uint64_t auto_host_context_ceiling_bytes(HostMemorySnapshot snapshot,
+                                                            const expert_offload::HostMemoryDemand& demand,
+                                                            std::uint64_t startup) noexcept;
+
+struct AutoHostTier {
+    std::uint64_t bytes = 0;
+    bool keeps_cap      = true;
+};
+[[nodiscard]] AutoHostTier plan_auto_host_tier(const HostMemorySnapshot& snapshot,
+                                               expert_offload::HostMemoryDemand demand) noexcept;
 
 // Plans `demand` against `snapshot`, reports the ledger (an Info summary, Debug details), refuses an
 // --expert-ram-mib the ledger cannot give (std::runtime_error), and asks Windows to keep the
@@ -69,6 +83,18 @@ inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
 // that sizes the exclusive RAM layout at start, ExpertOffload).
 [[nodiscard]] ExpertRamPlan plan_expert_ram(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand,
                                             const HostMemorySnapshot& snapshot, bool always_tier = false);
+
+[[nodiscard]] std::string expert_ram_refusal(const EngineOptions& options, const expert_offload::HostMemoryLedger& ledger);
+void reserve_expert_working_set(const EngineOptions& options, const expert_offload::HostMemoryDemand& demand);
+
+struct ExpertVramCheck {
+    expert_offload::VramSizing sizing;
+    std::string refusal; // empty: it fits
+};
+[[nodiscard]] ExpertVramCheck size_expert_vram(const EngineOptions& options, const std::string& model,
+                                               const VramSnapshot& before, std::uint64_t fixed, std::uint32_t graphs,
+                                               std::uint64_t frame_bytes, std::uint32_t max_frames,
+                                               const std::string& contributors);
 
 // The VRAM check before the weights are read: `fixed` (the dense weights and the Program's fixed
 // allocations) and the graph reserve for `graphs` executables must leave the expert cache room for
@@ -81,6 +107,7 @@ inline constexpr std::uint64_t kMinAutoHostContextBytes = 1ULL << 30;
 
 // An Engine diagnostic, or stderr (Info and above) without an observer.
 void report_engine(const EngineOptions& options, DiagnosticLevel level, const std::string& text);
+void report_kernel_images(const EngineOptions& options, double seconds);
 void report_diagnostic(const DiagnosticObserver& observer, DiagnosticLevel level, const std::string& text);
 
 } // namespace infernix::runtime

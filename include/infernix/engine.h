@@ -68,10 +68,32 @@ private:
     friend class Engine;
 };
 
+class EngineHost {
+public:
+    EngineHost();
+    ~EngineHost();
+    EngineHost(EngineHost&&) noexcept;
+    EngineHost& operator=(EngineHost&&) noexcept;
+    EngineHost(const EngineHost&)            = delete;
+    EngineHost& operator=(const EngineHost&) = delete;
+
+    void release() noexcept;
+    [[nodiscard]] std::uint64_t kept_bytes() const noexcept;
+
+private:
+    class Impl;
+    std::shared_ptr<Impl> impl_;
+
+    friend class Engine;
+};
+
 class Engine {
 public:
     explicit Engine(EngineOptions options);
+    Engine(EngineOptions options, EngineHost& host);
     ~Engine();
+
+    [[nodiscard]] static EnginePlan plan(EngineOptions options);
 
     Engine(Engine&&) noexcept;
     Engine& operator=(Engine&&) noexcept;
@@ -92,6 +114,7 @@ public:
     // Artifact-tokenizer decoding of token ids, special tokens included. The bytes of a character
     // that the ids cut are returned as they are (not necessarily valid UTF-8).
     [[nodiscard]] std::string detokenize(std::span<const TokenId> token_ids) const;
+    [[nodiscard]] std::string detokenize_bytes(std::span<const TokenId> token_ids) const;
 
     // The token ids of a text chat rendered with the artifact's chat template, whatever their number: unlike
     // prepare(), no max_context or capacity limit applies (a measurement tool cuts its windows from them).
@@ -139,11 +162,12 @@ public:
     [[nodiscard]] LoadSummary load_summary() const;
     [[nodiscard]] ModelMetadata model_metadata() const;
     [[nodiscard]] MemorySummary memory_summary() const;
+    [[nodiscard]] DeviceMemoryReading device_memory() const;
     [[nodiscard]] RuntimeStats runtime_stats() const;
+    [[nodiscard]] RequestMonitor request_monitor() const;
     [[nodiscard]] MediaCacheSummary media_cache_summary() const;
-    // Which instruction positions the active chat template renders; prompt preparation lowers an
-    // instruction turn that arrived in an unsupported position to a role the template does render.
     [[nodiscard]] ChatTemplateRoleSupport chat_template_role_support() const;
+    [[nodiscard]] VisionImageBudget vision_image_budget() const;
     [[nodiscard]] bool is_available() const;
     // True once an execution failure has ended every request: the Engine refuses new work until
     // the process starts a new one. An orderly stop() is not a failure.

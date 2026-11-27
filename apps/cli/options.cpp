@@ -1,5 +1,6 @@
 #include "options.h"
 #include "product/config/config_file.h"
+#include "product/kv_window_options.h"
 #include "product/logits_options.h"
 #include "product/speculative_options.h"
 
@@ -59,6 +60,7 @@ float parse_float(const char* text, std::string_view label, float minimum, float
 
 KvCacheStorage parse_kv_cache(std::string_view text) {
     if (text == "bf16") { return KvCacheStorage::BFloat16; }
+    if (text == "bf16p") { return KvCacheStorage::Bf16Packed; }
     if (text == "int8") { return KvCacheStorage::Int8Group64; }
     if (text == "fp8") { return KvCacheStorage::Fp8E4M3Row256; }
     if (text == "nvfp4") { return KvCacheStorage::Nvfp4Group16; }
@@ -85,6 +87,8 @@ constexpr std::array kCliOptions{
     CliOption{"--ngram-volume"},
     CliOption{"--ngram-residency"},
     CliOption{"--ngram-cache-mib"},
+    CliOption{"--lora"},
+    CliOption{"--ablate"},
     CliOption{"--expert-state"},
     CliOption{"--expert-stripe"},
     CliOption{"--grammar-file"},
@@ -106,6 +110,7 @@ constexpr std::array kCliOptions{
     CliOption{"--expert-ram-layout"},
     CliOption{"--expert-pin-mib"},
     CliOption{"--kv-dtype"},
+    CliOption{"--kv-window-dtype"},
     CliOption{"--logits-dtype"},
     CliOption{"--spec"},
     CliOption{"--draft-tokens"},
@@ -134,7 +139,10 @@ constexpr std::array kCliOptions{
     CliOption{"--lossless", false},
     CliOption{"--fast-path", true, true},
     CliOption{"--expert-a4-activations", false},
+    CliOption{"--a16-activations", false},
     CliOption{"--a8-activations", false},
+    CliOption{"--q8-weights", false},
+    CliOption{"--w4-weights", false},
     CliOption{"--embedding-host", false},
     CliOption{"--stop-token-id", true, true},
     CliOption{"--stop", true, true},
@@ -432,6 +440,10 @@ Options parse_options(int argc, char** argv) {
             options.ngram_residency = parse_ngram_residency(value(arg));
         } else if (arg == "--ngram-cache-mib") {
             options.ngram_cache_bytes = parse_u64(value(arg), "ngram-cache-mib") << 20;
+        } else if (arg == "--lora") {
+            options.lora_path = value(arg);
+        } else if (arg == "--ablate") {
+            options.ablate_sidecar_path = value(arg);
         } else if (arg == "--expert-state") {
             const std::string path = value(arg);
             options.expert_state   = path == "off" ? std::filesystem::path{} : std::filesystem::path(path);
@@ -510,6 +522,8 @@ Options parse_options(int argc, char** argv) {
             }
         } else if (arg == "--kv-dtype") {
             options.kv_cache = parse_kv_cache(value(arg));
+        } else if (arg == "--kv-window-dtype") {
+            options.kv_window_cache = product::parse_kv_window_dtype(value(arg));
         } else if (arg == "--logits-dtype") {
             options.logits_dtype = product::parse_logits_dtype(value(arg));
         } else if (arg == "--spec") {
@@ -599,8 +613,14 @@ Options parse_options(int argc, char** argv) {
             options.fast_path_candidates.push_back(*path);
         } else if (arg == "--expert-a4-activations") {
             options.expert_a4_activations = true;
+        } else if (arg == "--a16-activations") {
+            options.expert_a16_activations = true;
         } else if (arg == "--a8-activations") {
             options.a8_activations = true;
+        } else if (arg == "--q8-weights") {
+            options.q8_weights = true;
+        } else if (arg == "--w4-weights") {
+            options.w4_weights = true;
         } else if (arg == "--embedding-host") {
             options.embedding_host = true;
         } else if (arg == "--stop-token-id") {

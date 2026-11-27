@@ -34,6 +34,8 @@ struct RequestLogRotation {
 struct ServeOptions {
     bool help_requested = false;
     std::string artifact_path;
+    std::filesystem::path lora_path;
+    std::filesystem::path ablate_sidecar_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency    = NgramResidency::Auto;
@@ -56,7 +58,10 @@ struct ServeOptions {
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
+    bool w4_weights                = false; // EngineOptions::w4_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t max_concurrency      = 4;
     std::uint32_t max_pending_requests = 16;
@@ -84,6 +89,7 @@ struct ServeOptions {
     std::size_t response_store_max_bytes   = kDefaultResponseStoreBytes;
     int device                             = 0;
     KvCacheStorage kv_cache                = KvCacheStorage::BFloat16;
+    std::optional<KvCacheStorage> kv_window_cache;
     LogitsDtype logits_dtype               = LogitsDtype::FP32;
     SpeculativeOptions speculative;
     bool ngram_native_sessions = false;

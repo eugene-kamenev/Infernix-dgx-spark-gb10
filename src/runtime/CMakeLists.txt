@@ -4,7 +4,17 @@ add_library(infernix_runtime_support STATIC
   engine/kv_capacity.cpp
   engine/public_types.cpp
   prefix_cache/block_hash.cpp
+  prefix_cache/host_slab_store.cpp
+  prefix_cache/persist_file.cpp
   prefix_cache/prefix_index.cpp
+  prefix_cache/prefix_index_host.cpp
+  prefix_cache/prefix_index_invariants.cpp
+  prefix_cache/prefix_index_persist.cpp
+  prefix_cache/prefix_index_ssd.cpp
+  prefix_cache/ssd_tier.cpp
+  prefix_cache/ssd_write_budget.cpp
+  prefix_cache/fp32_row_codec.cpp
+  prefix_cache/source_policy.cpp
   prefix_cache/tap_planner.cpp
 )
 infernix_internal_includes(infernix_runtime_support)
@@ -12,9 +22,11 @@ target_link_libraries(infernix_runtime_support PUBLIC infernix_core PRIVATE infe
 
 # Public Engine and common contracts; model execution remains in the model layer.
 add_library(infernix_engine STATIC
+  engine/engine_plan.cpp
   engine/expert_memory.cpp
   engine/model_instance.cpp
   engine/qwen4_exp_instance.cpp
+  engine/inkling2_instance.cpp
   contract/sampling.cpp
   engine/engine.cpp
 )
