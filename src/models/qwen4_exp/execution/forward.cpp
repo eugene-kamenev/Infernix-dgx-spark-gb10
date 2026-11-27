@@ -690,7 +690,6 @@ Tensor Forward::mix(const HyperConnectionParameters& p, const Tensor& residual, 
 
 Tensor Forward::inject_mix(const HyperConnectionParameters& p, const Tensor& y, const Tensor& pending, Tensor& residual,
                            Tensor* inject, Tensor* into) {
-    (void)temporary_switches::flag("INFERNIX_TMP_HC_INJECT_FOLD");
     const cudaStream_t s = device_.stream;
     const std::int32_t T = residual.ne[1], H = dim(config_.hidden_size);
     const std::int32_t S = dim(config_.hc.streams), rank = dim(config_.hc.rank);
@@ -1224,7 +1223,19 @@ Tensor Forward::moe(const MoeParameters& p, const Tensor& x, std::uint32_t layer
     const bool route_plans = route_tap == nullptr && !streamed_chunk;
     ops::MoeExpertSource source = expert_source(p, layer);
     // --expert-tail-skip acts in generation rounds only; prefill, forced and scored tokens stay exact.
-    if (batch != nullptr && batch->decode_round) { source.tail_skip_rank = experts_.tail_skip_rank; }
+    if (batch != nullptr && batch->decode_round) {
+        source.tail_skip_rank = experts_.tail_skip_rank;
+        static const float draft_prune_tau = []() {
+            const char* env = std::getenv("INFERNIX_DRAFT_EXPERT_PRUNE");
+            if (env == nullptr || env[0] == '\0') { return 0.0F; }
+            return std::max(0.0F, std::strtof(env, nullptr));
+        }();
+        if (draft_prune_tau > 0.0F && batch->verify != nullptr && batch->width >= 2) {
+            source.draft_prune_threshold = draft_prune_tau;
+            source.draft_prune_stride    = batch->width;
+            source.routing_weights       = static_cast<const float*>(routing.weights.data);
+        }
+    }
     // Prefill chunks (one sequence of many positions, run eagerly) overlap staging with compute.
     if (eager_chunk_ && experts_.overlap_stream != nullptr) {
         source.overlap_stream = experts_.overlap_stream;

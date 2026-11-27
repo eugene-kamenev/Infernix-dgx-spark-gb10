@@ -60,10 +60,26 @@ __global__ void __launch_bounds__(kPlanThreads)
             const int columns = dispatch.offsets[expert + 1] - first;
             bool tail         = false;
             if (tail_flags != nullptr) {
-                tail = columns <= kMaxColumns;
-                for (int c = 0; c < columns && tail; ++c) {
-                    const int entry = dispatch.entries[first + c];
-                    tail            = entry < dispatch.shared_first && (entry % top_k) >= source.tail_skip_rank;
+                if (source.tail_skip_rank > 0 && columns <= kMaxColumns) {
+                    tail = true;
+                    for (int c = 0; c < columns && tail; ++c) {
+                        const int entry = dispatch.entries[first + c];
+                        tail            = entry < dispatch.shared_first && (entry % top_k) >= source.tail_skip_rank;
+                    }
+                }
+                if (!tail && source.draft_prune_threshold > 0.0F && source.routing_weights != nullptr &&
+                    source.draft_prune_stride >= 2 && columns <= kMaxColumns) {
+                    float weight_sum = 0.0F;
+                    bool has_base    = false;
+                    for (int c = 0; c < columns; ++c) {
+                        const int entry = dispatch.entries[first + c];
+                        if (entry >= dispatch.shared_first || ((entry / top_k) % source.draft_prune_stride) == 0) {
+                            has_base = true;
+                            break;
+                        }
+                        weight_sum += source.routing_weights[entry];
+                    }
+                    if (!has_base && weight_sum < source.draft_prune_threshold) { tail = true; }
                 }
                 tail_flags[job] = tail ? 2 : 0;
             }
@@ -889,8 +905,9 @@ Call prepare(const Tensor& x, const MoeDispatch& dispatch, const MoeExpertSource
     call.passes      = (max_jobs + pass_jobs - 1) / pass_jobs;
     call.mean_job_columns = entries / max_jobs;
     const bool cpu = source.cpu.max_jobs > 0 && x.ne[1] <= source.cpu.max_columns;
-    const bool resident_tail_skip = !cpu && source.tail_skip_rank > 0 && source.staging_slots == 0 &&
-                                    source.fetch.request == nullptr && x.ne[1] >= 2 && x.ne[1] <= kMaxColumns;
+    const bool resident_tail_skip = !cpu && (source.tail_skip_rank > 0 || source.draft_prune_threshold > 0.0F) &&
+                                    source.staging_slots == 0 && source.fetch.request == nullptr && x.ne[1] >= 2 &&
+                                    x.ne[1] <= kMaxColumns;
     const bool map_tokens = source.activation == ExpertActivation::kA4 && source.wide_a16 != WideA16::kLossless &&
                             entries == static_cast<int>(x.ne[1]) * top_k && workspace.entry_map != nullptr;
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, top_k, max_jobs, pass_jobs, call.passes,
@@ -1007,8 +1024,9 @@ void prepare_xplane(const Tensor& x, const MoeDispatch& dispatch, const MoeExper
     const int entries = tokens * top_k;
     const int passes  = (max_jobs + pass_jobs - 1) / pass_jobs;
     const bool cpu = source.cpu.max_jobs > 0 && tokens <= source.cpu.max_columns;
-    const bool resident_tail_skip = !cpu && source.tail_skip_rank > 0 && source.staging_slots == 0 &&
-                                    source.fetch.request == nullptr && tokens >= 2 && tokens <= kMaxColumns;
+    const bool resident_tail_skip = !cpu && (source.tail_skip_rank > 0 || source.draft_prune_threshold > 0.0F) &&
+                                    source.staging_slots == 0 && source.fetch.request == nullptr && tokens >= 2 &&
+                                    tokens <= kMaxColumns;
     plan_kernel<<<1, kPlanThreads, 0, stream>>>(dispatch, source, top_k, max_jobs, pass_jobs, passes,
                                                 cpu ? workspace.cpu_flags : nullptr,
                                                 resident_tail_skip ? workspace.cpu_flags : nullptr, workspace.job_records,

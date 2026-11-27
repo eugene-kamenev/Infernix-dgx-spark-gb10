@@ -4942,9 +4942,10 @@ void moe_experts_cpu_wait(const Tensor& x, const MoeDispatch& dispatch, const Mo
     if (!cpu_served(x, source)) {
         const bool ggml     = ggml_bank(source);
         const bool nvfp4_a8 = nvfp4_a8_call(source, static_cast<int>(x.ne[1]));
-        if (source.tail_skip_rank > 0 && source.staging_slots == 0 && source.fetch.request == nullptr &&
-            source.omma_narrow && !ggml && !nvfp4_a8 && source.activation == moe::ExpertActivation::kA4 &&
-            source.shape == moe::kFlashNextShape && x.ne[1] >= 2 && x.ne[1] <= moe::kMaxColumns) {
+        if ((source.tail_skip_rank > 0 || source.draft_prune_threshold > 0.0F) && source.staging_slots == 0 &&
+            source.fetch.request == nullptr && source.omma_narrow && !ggml && !nvfp4_a8 &&
+            source.activation == moe::ExpertActivation::kA4 && source.shape == moe::kFlashNextShape && x.ne[1] >= 2 &&
+            x.ne[1] <= moe::kMaxColumns) {
             const auto layout = moe::wide::carve_experts_workspace(workspace, source.shape, max_jobs, outputs.ne[1], x.ne[1],
                                                                    source.activation, source.wide_a16);
             if (layout.entry_map != nullptr && layout.narrow_jobs != nullptr && layout.pass_narrow != nullptr &&

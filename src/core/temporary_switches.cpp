@@ -85,10 +85,6 @@ constexpr Registration kSwitches[] = {
     // f16-accumulate-prefill on Q8 (Dense8): past 8,192 tokens only the problems measured faster take the route
     // (ops/linear/q8/q8_f16acc.cu q8_f16acc_admits).
     {"INFERNIX_TMP_Q8_F16ACC_ADMIT", Scope::Qwen4Exp, Kind::Flag},
-    // Flash-Next: each block's attention-half inject folded into the MLP half's fused mixer reads
-    // (ops::hyper_connection_inject_mix; models/qwen4_exp/execution/forward.cpp; candidates §7.3 D6).
-    // Same bits.
-    {"INFERNIX_TMP_HC_INJECT_FOLD", Scope::Qwen4Exp, Kind::Flag},
     // Flash-Next dflash2-pairs: DFlash2 rounds of up to <value> rows (2..8; 2: today's pairs only)
     // (models/qwen4_exp/program/program_impl.h dflash2_rows_). Bits as dflash2-pairs'.
     {"INFERNIX_TMP_DFLASH2_ROWS", Scope::Qwen4Exp, Kind::Value},

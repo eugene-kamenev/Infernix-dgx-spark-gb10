@@ -355,6 +355,13 @@ struct MoeExpertSource {
     // renormalisation). It changes the output; the routing and route log are unchanged, so the
     // expert is still credited as routed.
     std::int32_t tail_skip_rank = 0;
+    // Optional batch-shared draft expert pruning (0.0f: off): in verify calls with width >= 2,
+    // any routed expert not used by any lane's base column (t % draft_prune_stride == 0) whose
+    // batch-summed routing weight sum(g_{t,e}) < draft_prune_threshold is skipped (outputs zeroed,
+    // weights not read from DRAM).
+    float draft_prune_threshold      = 0.0F;
+    std::int32_t draft_prune_stride  = 0;
+    const float* routing_weights     = nullptr; // device FP32 [k, T], indexed by entry = t * k + slot
     // Use native sm_121a NVFP4 OMMA kernels for narrow/medium (1..8 column) W4A4 jobs instead of DP4A.
     bool omma_narrow = false;
 };
