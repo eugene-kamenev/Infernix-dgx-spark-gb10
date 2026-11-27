@@ -54,7 +54,8 @@ void candidate_selector_path(const Tensor& candidate_ids, const Tensor& unary_sc
                              const Tensor& predecessor_codebook, const Tensor& successor_codebook,
                              const Tensor& base_positions, const SamplingConfig* configs,
                              Tensor& drafts, Tensor& proposal_q, Tensor* confidence,
-                             WorkspaceArena& workspace, cudaStream_t stream);
+                             WorkspaceArena& workspace, cudaStream_t stream, float edge_softcap = 0.0F,
+                             bool couple_draws = false);
 
 /**
  * Op: candidate_selector_tree

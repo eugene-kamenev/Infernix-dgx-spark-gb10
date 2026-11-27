@@ -41,6 +41,8 @@ struct VramSnapshot {
     bool has_budget            = false;
     std::uint64_t local_budget = 0;
     std::uint64_t local_usage  = 0;
+    bool has_local_usage       = false;
+    bool free_from_budget      = false;
     DisplayState display       = DisplayState::Unknown;
     int outputs                = -1; // DXGI outputs of the adapter; -1 unknown
     std::uint64_t budget_allowance = 0;
@@ -53,6 +55,8 @@ struct VramSnapshot {
     // size, often half of RAM (80 % on that machine); the NON_LOCAL budget is not the limit.
     std::uint64_t shared_system  = 0;
     std::uint64_t nonlocal_usage = 0;
+    std::uint64_t physical_used  = 0;
+    std::uint64_t physical_free  = 0;
 };
 
 // One device's source. query() may be called from any thread on which the device is current.
@@ -60,6 +64,7 @@ class VramBudgetSource {
 public:
     virtual ~VramBudgetSource()             = default;
     [[nodiscard]] virtual VramSnapshot query() = 0;
+    [[nodiscard]] virtual void* change_event() { return nullptr; }
 
 };
 

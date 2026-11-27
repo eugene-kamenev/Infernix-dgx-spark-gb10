@@ -40,6 +40,24 @@ struct PhysicalCore {
 // mask (0 when unknown or when the change failed).
 std::uint64_t set_current_thread_cpus(std::uint64_t cpus) noexcept;
 
+class ScopedThreadCpus {
+public:
+    explicit ScopedThreadCpus(std::uint64_t cpus) noexcept : previous_(set_current_thread_cpus(cpus)) {}
+    ~ScopedThreadCpus() { restore(); }
+    ScopedThreadCpus(const ScopedThreadCpus&)            = delete;
+    ScopedThreadCpus& operator=(const ScopedThreadCpus&) = delete;
+    void restore() noexcept {
+        if (!restored_) { (void)set_current_thread_cpus(previous_); }
+        restored_ = true;
+    }
+
+private:
+    std::uint64_t previous_;
+    bool restored_ = false;
+};
+
+[[nodiscard]] std::uint64_t slow_core_cpus();
+
 namespace core {
 
 // The performance-tier logical CPUs, sorted highest-capacity first; empty when the host is

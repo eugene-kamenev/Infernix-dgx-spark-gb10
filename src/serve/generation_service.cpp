@@ -359,6 +359,8 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     : options_(std::move(options)) {
     infernix::EngineOptions engine_options;
     engine_options.artifact_path            = options_.artifact_path;
+    engine_options.lora_path                = options_.lora_path;
+    engine_options.ablate_sidecar_path      = options_.ablate_sidecar_path;
     engine_options.chat_template_path       = options_.chat_template_path;
     engine_options.ngram_volume_path        = options_.ngram_volume_path;
     engine_options.ngram_residency          = options_.ngram_residency;
@@ -377,7 +379,10 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.vram_headroom_bytes      = options_.vram_headroom_bytes;
     engine_options.expert_tail_skip         = options_.expert_tail_skip;
     engine_options.expert_a4_activations    = options_.expert_a4_activations;
+    engine_options.expert_a16_activations   = options_.expert_a16_activations;
     engine_options.a8_activations           = options_.a8_activations;
+    engine_options.q8_weights               = options_.q8_weights;
+    engine_options.w4_weights               = options_.w4_weights;
     engine_options.embedding_host           = options_.embedding_host;
     engine_options.max_concurrency          = options_.max_concurrency;
     engine_options.max_pending_requests     = options_.max_pending_requests;
@@ -391,6 +396,7 @@ GenerationService::GenerationService(ServeOptions options, StartupObserver start
     engine_options.lossless                      = options_.lossless;
     engine_options.fast_path_candidates          = options_.fast_path_candidates;
     engine_options.kv_cache                  = options_.kv_cache;
+    engine_options.kv_window_cache           = options_.kv_window_cache;
     engine_options.logits_dtype              = options_.logits_dtype;
     engine_options.enable_vision             = options_.enable_vision;
     engine_options.vision_offload            = options_.vision_offload;

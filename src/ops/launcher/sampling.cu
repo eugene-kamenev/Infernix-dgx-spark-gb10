@@ -17,19 +17,30 @@ __global__ void increment_token_counts_kernel(const std::int32_t* token_ids, std
     if (index < count) { atomicAdd(&token_counts[token_ids[index]], 1); }
 }
 
+__global__ void increment_licensed_token_counts_kernel(const std::int32_t* licensed_tokens, const std::int32_t* counts,
+                                                       const SamplingConfig* configs, std::int32_t width) {
+    const int row              = blockIdx.x;
+    std::int32_t* token_counts = configs[row].token_counts;
+    if (token_counts == nullptr) { return; }
+    const std::int32_t licensed = min(max(counts[row], 0), width);
+    for (int j = threadIdx.x; j < licensed; j += blockDim.x) {
+        atomicAdd(&token_counts[licensed_tokens[static_cast<std::int64_t>(row) * width + j]], 1);
+    }
+}
+
 std::size_t sampling_workspace_exact_bytes(std::int32_t token_domain, std::int32_t columns) {
     return make_sampling_workspace_layout(token_domain, columns).bytes;
 }
 
 namespace {
 
-template <class Logit>
+template <class Logit, bool Full>
 void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, std::int32_t physical_rows,
                   std::int32_t batch, const SamplingConfig* configs, const std::int32_t* positions,
                   std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
     const SamplingWorkspaceLayout layout = make_sampling_workspace_layout(token_domain, batch);
     if (!layout.multiblock) {
-        sample_row_kernel<Logit, SamplerRowSchedule>
+        sample_row_kernel<Logit, SamplerRowSchedule, Full>
             <<<static_cast<unsigned int>(batch), SamplerRowSchedule::kSamplerBlock, 0, stream>>>(
                 logits, static_cast<std::int32_t*>(out.data), configs, positions, purpose,
                 token_domain, physical_rows);
@@ -42,32 +53,52 @@ void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, s
     const SamplingWorkspace scratch = layout.bind(workspace);
     const dim3 partial_grid(static_cast<unsigned int>(partial_blocks),
                             static_cast<unsigned int>(batch));
-    sampling_partial_topk_kernel<Logit, SamplerParallelSchedule, true>
-        <<<partial_grid, SamplerParallelSchedule::kSamplerBlock, 0, stream>>>(
-            logits, configs, token_domain, physical_rows, scratch);
+    if constexpr (Full) {
+        sampling_partial_topk_full_kernel<Logit, SamplerParallelSchedule>
+            <<<partial_grid, SamplerParallelSchedule::kSamplerBlock, 0, stream>>>(
+                logits, configs, positions, purpose, token_domain, physical_rows, scratch);
+    } else {
+        sampling_partial_topk_kernel<Logit, SamplerParallelSchedule, true>
+            <<<partial_grid, SamplerParallelSchedule::kSamplerBlock, 0, stream>>>(
+                logits, configs, token_domain, physical_rows, scratch);
+    }
     CUDA_CHECK(cudaGetLastError());
     const dim3 group_grid(static_cast<unsigned int>(groups), static_cast<unsigned int>(batch));
-    sampling_group_finalize_sample_kernel<SamplerParallelSchedule, true>
+    sampling_group_finalize_sample_kernel<SamplerParallelSchedule, true, Full>
         <<<group_grid, SamplerParallelSchedule::kSamplerGroupBlock, 0, stream>>>(
             static_cast<std::int32_t*>(out.data), configs, positions, purpose, token_domain,
             partial_blocks, groups, scratch);
     CUDA_CHECK(cudaGetLastError());
 }
 
+template <class Logit>
+void sample_batch(const Logit* logits, Tensor& out, std::int32_t token_domain, std::int32_t physical_rows,
+                  std::int32_t batch, const SamplingConfig* configs, const std::int32_t* positions,
+                  std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream, bool full_vocabulary_rows) {
+    if (full_vocabulary_rows) {
+        sample_batch<Logit, true>(logits, out, token_domain, physical_rows, batch, configs, positions, purpose,
+                                  workspace, stream);
+    } else {
+        sample_batch<Logit, false>(logits, out, token_domain, physical_rows, batch, configs, positions, purpose,
+                                   workspace, stream);
+    }
+}
+
 } // namespace
 
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream) {
+                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
+                         bool full_vocabulary_rows) {
     const std::int32_t physical_rows = logits.ne[0];
     const std::int32_t batch         = logits.ne[1];
     const auto* positions            = static_cast<const std::int32_t*>(logical_positions.data);
     if (logits.dtype == DType::FP32) {
         sample_batch(static_cast<const float*>(logits.data), out, token_domain, physical_rows, batch, configs,
-                     positions, purpose, workspace, stream);
+                     positions, purpose, workspace, stream, full_vocabulary_rows);
     } else {
         sample_batch(static_cast<const __nv_bfloat16*>(logits.data), out, token_domain, physical_rows, batch,
-                     configs, positions, purpose, workspace, stream);
+                     configs, positions, purpose, workspace, stream, full_vocabulary_rows);
     }
 }
 
@@ -94,6 +125,14 @@ void increment_token_counts_launch(const Tensor& token_ids, Tensor& token_counts
     increment_token_counts_kernel<<<div_up(count, kBlock), kBlock, 0, stream>>>(
         static_cast<const std::int32_t*>(token_ids.data), count,
         static_cast<std::int32_t*>(token_counts.data));
+    CUDA_CHECK(cudaGetLastError());
+}
+
+void increment_licensed_token_counts_launch(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                            const SamplingConfig* configs, cudaStream_t stream) {
+    increment_licensed_token_counts_kernel<<<licensed_tokens.ne[1], 32, 0, stream>>>(
+        static_cast<const std::int32_t*>(licensed_tokens.data), static_cast<const std::int32_t*>(licensed_counts.data),
+        configs, licensed_tokens.ne[0]);
     CUDA_CHECK(cudaGetLastError());
 }
 

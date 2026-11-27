@@ -23,7 +23,7 @@ from pathlib import Path
 
 getcontext().prec = 60
 
-EXP, SIGMOID, SIGMOID_BF16, SILU, SILU_BF16, SOFTPLUS, RSQRT, COS, SIN = range(9)
+EXP, SIGMOID, SIGMOID_BF16, SILU, SILU_BF16, SOFTPLUS, RSQRT, COS, SIN, TANH, LOG = range(11)
 
 # pi to 110 digits: arguments below 2^20 reduce with an error far below the 60-digit evaluation's.
 PI = Decimal("3.14159265358979323846264338327950288419716939937510582097494459230781640628620899862803482534211706798214808651")
@@ -108,6 +108,26 @@ def cos_sin(d: Decimal) -> tuple[Decimal, Decimal]:
     return +c, +s
 
 
+def tanh(d: Decimal) -> Decimal:
+    """tanh at 60 digits: the odd series below 10^-3 (its truncation after d^11 is below 10^-36 relative),
+    else (1 - t) / (1 + t) with t = exp(-2 |d|) (no overflow, and 1 - t keeps all but 3 digits)."""
+    if d == 0:
+        return d  # tanh(+-0) = +-0
+    a = abs(d)
+    if a < Decimal("1e-3"):
+        d2 = d * d
+        coefficients = [Decimal(1), Decimal(-1) / 3, Decimal(2) / 15, Decimal(-17) / 315, Decimal(62) / 2835,
+                        Decimal(-1382) / 155925]
+        total, power = Decimal(0), d
+        for c in coefficients:
+            total += c * power
+            power *= d2
+        return total
+    t = (-2 * a).exp()
+    r = (Decimal(1) - t) / (Decimal(1) + t)
+    return r if d > 0 else -r
+
+
 def evaluate(func: int, x: float) -> int:
     d = Decimal(x)
     if func == SIN and d == 0:
@@ -127,6 +147,10 @@ def evaluate(func: int, x: float) -> int:
         return round_binary((Decimal(1) + d.exp()).ln(), 24)
     if func == RSQRT:
         return round_binary(Decimal(1) / d.sqrt(), 24)
+    if func == TANH:
+        return round_binary(tanh(d), 24)
+    if func == LOG:
+        return round_binary(d.ln(), 24)
     raise ValueError(func)
 
 

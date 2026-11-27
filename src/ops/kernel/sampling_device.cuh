@@ -256,6 +256,11 @@ __device__ __forceinline__ bool sampling_token_forbidden(int v, const SamplingCo
     return true;
 }
 
+__device__ __forceinline__ bool sampling_adjusts(const SamplingConfig& c) {
+    return c.presence_penalty != 0.0f || c.frequency_penalty != 0.0f || c.reasoning_close >= 0 ||
+           c.forbidden_token >= 0;
+}
+
 __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const SamplingConfig& c,
                                                          const std::int32_t* overlay = nullptr,
                                                          int overlay_len             = 0) {
@@ -263,6 +268,12 @@ __device__ __forceinline__ float sampling_adjusted_logit(float raw, int v, const
         return -CUDART_INF_F;
     }
     if (sampling_token_forbidden(v, c, overlay, overlay_len)) { return -CUDART_INF_F; }
+    if (c.reasoning_close >= 0 &&
+        (v == c.reasoning_ends[0] || v == c.reasoning_ends[1] || v == c.reasoning_withheld)) {
+        bool closed = false;
+        for (int j = 0; j < overlay_len; ++j) { closed = closed || overlay[j] == c.reasoning_close; }
+        if (!closed) { return -CUDART_INF_F; }
+    }
     float x = raw;
     if (c.presence_penalty == 0.0f && c.frequency_penalty == 0.0f) { return x; }
     int cnt = c.token_counts != nullptr ? c.token_counts[v] : 0;
@@ -493,6 +504,27 @@ __device__ inline int sampling_gumbel_pick_warp(int token, float p, int n, unsig
 // prefill passes the produced position, decode the input token's).
 __device__ __forceinline__ int sampling_produced_position(int logical_position, int purpose) {
     return purpose == kSamplePurposePrefill ? logical_position : logical_position + 1;
+}
+
+__device__ __forceinline__ bool sampling_full(const SamplingConfig& c) {
+    return c.full_vocabulary && c.temperature > 0.0f;
+}
+
+__device__ __forceinline__ float sampling_full_noise(unsigned long long seed, int position, int token) {
+    unsigned long long key = sampling_splitmix64(
+        seed ^ (static_cast<unsigned long long>(static_cast<unsigned int>(position)) * 0xD1B54A32D192ED03ull));
+    key = sampling_splitmix64(key ^ (static_cast<unsigned long long>(kSamplePurposeGumbel) << 21) ^
+                              (static_cast<unsigned long long>(static_cast<unsigned int>(token)) *
+                               0x2545F4914F6CDD1Dull));
+    const float w = fminf((static_cast<float>(static_cast<unsigned int>(key >> 32)) + 0.5f) * 0x1p-32f,
+                          0x1.fffffep-1f);
+    const float e = -log1pf(-w);
+    return -__logf(e);
+}
+
+__device__ __forceinline__ float sampling_full_score(float adjusted, const SamplingConfig& c, int position,
+                                                     int token) {
+    return __fadd_rn(__fdiv_rn(adjusted, c.temperature), sampling_full_noise(c.seed, position, token));
 }
 
 // thread-0 helper: inverse-CDF pick over a normalized `prob[0..n-1]` support,

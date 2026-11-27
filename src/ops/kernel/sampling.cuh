@@ -145,7 +145,7 @@ sampling_schedule_store_bf16_tile_topk(unsigned int (&keys)[S::kSamplerItemsPerT
     }
 }
 
-template <class Logit, class S = SamplerRowSchedule>
+template <class Logit, class S = SamplerRowSchedule, bool Full = false>
 __launch_bounds__(S::kSamplerBlock) __global__
     void sample_row_kernel(const Logit* logits, std::int32_t* out,
                            const SamplingConfig* configs, const std::int32_t* logical_positions,
@@ -160,12 +160,24 @@ __launch_bounds__(S::kSamplerBlock) __global__
     __shared__ float red_val[S::kSamplerBlock];
     __shared__ int red_idx[S::kSamplerBlock];
 
+    const bool full = Full && sampling_full(cfg);
     // With penalties disabled this remains the exact raw-logit argmax route.
-    if (!(cfg.temperature > 0.0f)) {
+    if (!(cfg.temperature > 0.0f) || full) {
         float bv             = -CUDART_INF_F;
         int bi               = INT_MAX;
-        const bool penalties = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
-        if (!penalties && cfg.mask.words == nullptr && cfg.forbidden_token < 0) {
+        const bool penalties = sampling_adjusts(cfg);
+        if (full) {
+            const int produced = sampling_produced_position(logical_positions[row], purpose);
+            for (int v = tid; v < token_domain; v += blockDim.x) {
+                const float raw = sampling_logit(logits[base + v]);
+                const float adj = (penalties || cfg.mask.words) ? sampling_adjusted_logit(raw, v, cfg) : raw;
+                const float x   = sampling_full_score(adj, cfg, produced, v);
+                if (sampling_better(x, v, bv, bi)) {
+                    bv = x;
+                    bi = v;
+                }
+            }
+        } else if (!penalties && cfg.mask.words == nullptr) {
             if constexpr (std::is_same_v<Logit, float>) {
                 if ((reinterpret_cast<std::uintptr_t>(logits + base) % 16 == 0) && (token_domain >= 32)) {
                     const auto* row4 = reinterpret_cast<const float4*>(logits + base);
@@ -328,11 +340,11 @@ __launch_bounds__(S::kSamplerBlock) __global__
     if (cfg.token_counts != nullptr) { atomicAdd(&cfg.token_counts[picked], 1); }
 }
 
-template <class Logit, class S = SamplerParallelSchedule, bool WarpTiles = true>
-__launch_bounds__(S::kSamplerBlock) __global__
-    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
-                                      std::int32_t token_domain, std::int32_t physical_rows,
-                                      SamplingWorkspace workspace) {
+template <class Logit, class S = SamplerParallelSchedule, bool WarpTiles = true, bool Full = false>
+__device__ __forceinline__ void sampling_partial_topk_body(const Logit* logits, const SamplingConfig* cfg_ptr,
+                                                           const std::int32_t* logical_positions, std::int32_t purpose,
+                                                           std::int32_t token_domain, std::int32_t physical_rows,
+                                                           SamplingWorkspace workspace) {
     pdl::enter();
     const int col            = static_cast<int>(blockIdx.y);
     const int partial        = static_cast<int>(blockIdx.x);
@@ -346,12 +358,33 @@ __launch_bounds__(S::kSamplerBlock) __global__
     unsigned long long keys[S::kSamplerItemsPerThread];
 
     const bool greedy       = !(cfg.temperature > 0.0f);
-    const bool penalties    = cfg.presence_penalty != 0.0f || cfg.frequency_penalty != 0.0f;
+    const bool penalties    = sampling_adjusts(cfg);
     const int cap           = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     const std::int64_t base = static_cast<std::int64_t>(col) * physical_rows;
     const int tile_start    = partial * S::kSamplerPartialTileItems;
+    if constexpr (Full) {
+        if (sampling_full(cfg)) {
+            const int produced      = sampling_produced_position(logical_positions[col], purpose);
+            unsigned long long best = 0ull;
+            for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
+                const int v = tile_start + item * blockDim.x + threadIdx.x;
+                if (v < token_domain) {
+                    const float raw = sampling_logit(logits[base + v]);
+                    const float x   = (penalties || cfg.mask.words) ? sampling_adjusted_logit(raw, v, cfg) : raw;
+                    const unsigned long long key = sampling_sort_key(sampling_full_score(x, cfg, produced, v), v);
+                    if (key > best) { best = key; }
+                }
+            }
+            best = sampling_block_max_key(best, greedy_warp_keys);
+            if (threadIdx.x == 0) { workspace.partial_keys[sampling_partial_offset(workspace, col, partial, 0)] = best; }
+            return;
+        }
+    } else {
+        (void)logical_positions;
+        (void)purpose;
+    }
     if constexpr (WarpTiles && std::is_same_v<Logit, __nv_bfloat16>) {
-        if (!greedy && !penalties && cfg.forbidden_token < 0) {
+        if (!greedy && !penalties) {
             unsigned int raw_keys[S::kSamplerItemsPerThread];
 #pragma unroll
             for (int item = 0; item < S::kSamplerItemsPerThread; ++item) {
@@ -410,7 +443,26 @@ __launch_bounds__(S::kSamplerBlock) __global__
     }
 }
 
-template <class S = SamplerParallelSchedule, bool DirectGreedy = true>
+template <class Logit, class S = SamplerParallelSchedule, bool WarpTiles = true>
+__launch_bounds__(S::kSamplerBlock) __global__
+    void sampling_partial_topk_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
+                                      std::int32_t token_domain, std::int32_t physical_rows,
+                                      SamplingWorkspace workspace) {
+    sampling_partial_topk_body<Logit, S, WarpTiles, false>(logits, cfg_ptr, nullptr, 0, token_domain,
+                                                           physical_rows, workspace);
+}
+
+template <class Logit, class S = SamplerParallelSchedule>
+__launch_bounds__(S::kSamplerBlock, 9) __global__
+    void sampling_partial_topk_full_kernel(const Logit* logits, const SamplingConfig* cfg_ptr,
+                                           const std::int32_t* logical_positions, std::int32_t purpose,
+                                           std::int32_t token_domain, std::int32_t physical_rows,
+                                           SamplingWorkspace workspace) {
+    sampling_partial_topk_body<Logit, S, true, true>(logits, cfg_ptr, logical_positions, purpose,
+                                                     token_domain, physical_rows, workspace);
+}
+
+template <class S = SamplerParallelSchedule, bool DirectGreedy = true, bool Full = false>
 __launch_bounds__(S::kSamplerGroupBlock) __global__ void sampling_group_finalize_sample_kernel(
     std::int32_t* out, const SamplingConfig* cfg_ptr, const std::int32_t* logical_positions,
     std::int32_t purpose, std::int32_t token_domain, std::int32_t partial_blocks,
@@ -429,7 +481,7 @@ __launch_bounds__(S::kSamplerGroupBlock) __global__ void sampling_group_finalize
     __shared__ unsigned long long greedy_warp_keys[S::kSamplerGroupBlock / 32];
     unsigned long long keys[S::kSamplerGroupItemsPerThread];
 
-    const bool greedy = !(cfg.temperature > 0.0f);
+    const bool greedy = !(cfg.temperature > 0.0f) || (Full && sampling_full(cfg));
     const int cap     = greedy ? 1 : sampling_candidate_cap(cfg, token_domain);
     // The preceding partial launch initializes group_done[col], so caller-owned
     // workspace does not rely on prior contents or a separate memset launch.

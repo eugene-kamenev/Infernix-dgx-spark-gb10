@@ -9,7 +9,10 @@
 
 #include <algorithm>
 #include <chrono>
-#include <cstdlib>
+#include <condition_variable>
+#include <deque>
+#include <future>
+#include <mutex>
 #include <stdexcept>
 #include <thread>
 
@@ -103,16 +106,13 @@ std::string quoted(unsigned char c) {
     return result;
 }
 
-// Free reasoning is any token but the close token (and any optional excluded token, such as
-// `<tool_call>` when a tool grammar is active); the close token then requires the separator.
-// Its spelling in ordinary tokens stays reasoning, as in the output decoder. Concatenation keeps
-// the user's rule names in their own namespace.
+// Free reasoning is any token but the close token (and the withheld token, if any); the close token
+// then requires the separator. Its spelling in ordinary tokens stays reasoning, as in the output
+// decoder. Concatenation keeps the user's rule names in their own namespace.
 xgrammar::Grammar reasoning_prefix(const ReasoningFraming& framing) {
     const std::string close = std::to_string(*framing.close_token);
     std::string excluded    = close;
-    if (framing.excluded_token && *framing.excluded_token != *framing.close_token) {
-        excluded += ", " + std::to_string(*framing.excluded_token);
-    }
+    if (framing.withheld_token) { excluded += ", " + std::to_string(*framing.withheld_token); }
     std::string source = "root ::= reasoning\nreasoning ::= ExcludeToken(" + excluded +
                          ") reasoning | Token(" + close + ")";
     for (unsigned char c : framing.separator) { source += " " + quoted(c); }
@@ -122,14 +122,31 @@ xgrammar::Grammar reasoning_prefix(const ReasoningFraming& framing) {
 // The compile-cache identity of a reasoning framing.
 std::string framing_key(const ReasoningFraming& framing) {
     if (!framing.close_token) { return "-:"; }
-    std::string key = std::to_string(*framing.close_token) + ":";
-    if (framing.excluded_token) { key += std::to_string(*framing.excluded_token); }
-    key += ":" + std::to_string(framing.separator.size()) + ":" + std::string(framing.separator);
-    return key;
+    return std::to_string(*framing.close_token) + ":" + std::to_string(framing.separator.size()) +
+           ":" + std::string(framing.separator) + ":" +
+           (framing.withheld_token ? std::to_string(*framing.withheld_token) : "-");
 }
 
+// A request's GBNF free text (ExcludeToken) beside a model's reserved protocol tokens: it excludes
+// them as well, so the content never writes the model's framing.
+class ReservedExclusion final : public xgrammar::GrammarMutator {
+public:
+    explicit ReservedExclusion(const std::vector<std::int32_t>& reserved) : reserved_(reserved) {}
+
+private:
+    int32_t VisitExcludeToken(const GrammarExpr& expression) final {
+        std::vector<int32_t> ids(expression.begin(), expression.end());
+        for (const std::int32_t id : reserved_) {
+            if (std::find(ids.begin(), ids.end(), id) == ids.end()) { ids.push_back(id); }
+        }
+        return builder_->AddExcludeTokenSet(ids);
+    }
+
+    const std::vector<std::int32_t>& reserved_;
+};
+
 void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& vocab,
-              const std::vector<std::int32_t>& eos) {
+              const std::vector<std::int32_t>& eos, const std::vector<std::int32_t>& reserved) {
     for (int i = 0; i < grammar->NumRules(); ++i) {
         const auto& rule = grammar->GetRule(i);
         if (rule.max_tokens >= 0 || rule.max_chars >= 0 || !rule.capture_name.empty() ||
@@ -142,14 +159,14 @@ void validate(const xgrammar::Grammar& grammar, const std::vector<std::string>& 
     for (int i = 0; i < grammar->NumGrammarExprs(); ++i) {
         const auto expression = grammar->GetGrammarExpr(i);
         if (expression.type == Type::kTagDispatch || expression.type == Type::kTokenTagDispatch ||
-            expression.type == Type::kRegex || expression.type == Type::kByteFSM ||
-            expression.type == Type::kSubstring) {
+            expression.type == Type::kRegex || expression.type == Type::kSubstring) {
             throw std::invalid_argument("grammar uses an extension outside the GBNF contract");
         }
         if (expression.type == Type::kToken || expression.type == Type::kExcludeToken) {
             for (int id : expression) {
                 if (id < 0 || static_cast<std::size_t>(id) >= vocab.size() || vocab[id].empty() ||
-                    std::find(eos.begin(), eos.end(), id) != eos.end()) {
+                    std::find(eos.begin(), eos.end(), id) != eos.end() ||
+                    std::find(reserved.begin(), reserved.end(), id) != reserved.end()) {
                     throw std::invalid_argument(
                         "GBNF token references must name ordinary vocabulary tokens");
                 }
@@ -184,62 +201,192 @@ std::shared_ptr<const std::vector<std::int32_t>> tokens_containing(const std::ve
     return ids;
 }
 
-int resolve_compiler_threads() noexcept {
+// Threads one cold compile's token-mask pass runs on: a quarter of the hardware threads, at most 8, so a compile
+// beside an offloaded model's CPU expert team takes a minority of the cores. A 20-tool Qwen tool grammar on the
+// RTX 5090 machine (32 threads): 0.78 s on one thread, 0.14 s on 8, 0.11-0.13 s on 16 (QH-01, 2026-11-16).
+int grammar_compile_threads() {
     if (const char* env = std::getenv("INFERNIX_GRAMMAR_THREADS")) {
         char* end = nullptr;
         const long val = std::strtol(env, &end, 10);
-        if (end != env && val > 0 && val <= 64) {
-            return static_cast<int>(val);
-        }
+        if (end != env && val > 0 && val <= 64) { return static_cast<int>(val); }
     }
-    const unsigned int hw = std::thread::hardware_concurrency();
-    return hw == 0 ? 8 : std::clamp(static_cast<int>(hw), 1, 8);
+    return static_cast<int>(std::clamp(std::thread::hardware_concurrency() / 4U, 1U, 8U));
 }
 } // namespace
 
+// A deferred compile's result, made on a compiler worker.
+struct DeferredGrammar {
+    xgrammar::CompiledGrammar grammar;
+    double seconds;
+    ConstraintCacheAccess cache;
+};
+
 class GrammarCompiler::Impl {
 public:
-    Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes)
+    // The workers deferred compiles run on: the vendored compiler admits two cold compiles at once.
+    static constexpr std::size_t kWorkers = 2;
+
+    Impl(std::vector<std::string> vocab_, std::vector<std::int32_t> eos_, std::size_t bytes,
+         std::vector<std::int32_t> reserved_)
         : vocab(std::make_shared<const std::vector<std::string>>(std::move(vocab_))),
-          eos(std::move(eos_)), tag_ends(tokens_containing(*vocab, '>')),
+          eos(std::move(eos_)), reserved(std::move(reserved_)), tag_ends(tokens_containing(*vocab, '>')),
           tokenizer(*vocab, xgrammar::VocabType::RAW, static_cast<int>(vocab->size()), eos),
-          compiler(tokenizer, resolve_compiler_threads(), true, static_cast<std::int64_t>(bytes)) {}
+          compiler(tokenizer, grammar_compile_threads(), true, static_cast<std::int64_t>(bytes)) {}
+
+    ~Impl() {
+        {
+            std::lock_guard lock(jobs_mutex);
+            stopping = true;
+        }
+        jobs_ready.notify_all();
+        for (auto& worker : workers) { worker.join(); }
+        // Compiles still queued are destroyed unrun: their sessions see a broken promise.
+    }
+
+    // Compiles `grammar` (already built and validated) under `key` on a worker. A compile error
+    // the library reports becomes a RequestError of `error_kind` when one is given, as compile()'s
+    // own path reports it.
+    std::shared_future<DeferredGrammar> defer(std::string key, xgrammar::Grammar grammar,
+                                              std::optional<RequestErrorKind> error_kind) {
+        std::packaged_task<DeferredGrammar()> job(
+            [this, key = std::move(key), grammar = std::move(grammar), error_kind]() {
+                const auto started = std::chrono::steady_clock::now();
+                xgrammar::CompilationCacheAccess access;
+                auto compiled = [&] {
+                    try {
+                        return compiler.CompileCachedGrammar(key, [&] { return grammar; }, &access);
+                    } catch (const xgrammar::LogFatalError& error) {
+                        if (!error_kind) { throw; }
+                        throw RequestError(*error_kind, error.what());
+                    }
+                }();
+                return DeferredGrammar{
+                    std::move(compiled),
+                    std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count(),
+                    cache_access(access)};
+            });
+        auto result = job.get_future().share();
+        {
+            std::lock_guard lock(jobs_mutex);
+            if (stopping) { throw std::logic_error("grammar compiler is stopping"); }
+            jobs.push_back(std::move(job));
+            if (workers.size() < kWorkers && jobs.size() > idle) {
+                workers.emplace_back([this] { work(); });
+            }
+        }
+        jobs_ready.notify_one();
+        return result;
+    }
 
     std::shared_ptr<const std::vector<std::string>> vocab;
     std::vector<std::int32_t> eos;
+    std::vector<std::int32_t> reserved;
     std::shared_ptr<const std::vector<std::int32_t>> tag_ends;
     xgrammar::TokenizerInfo tokenizer;
     xgrammar::GrammarCompiler compiler;
+
+private:
+    void work() {
+        std::unique_lock lock(jobs_mutex);
+        for (;;) {
+            ++idle;
+            jobs_ready.wait(lock, [&] { return stopping || !jobs.empty(); });
+            --idle;
+            if (stopping) { return; }
+            auto job = std::move(jobs.front());
+            jobs.pop_front();
+            lock.unlock();
+            job(); // a compile error is stored in the job's future
+            lock.lock();
+        }
+    }
+
+    std::mutex jobs_mutex;
+    std::condition_variable jobs_ready;
+    std::deque<std::packaged_task<DeferredGrammar()>> jobs;
+    std::size_t idle = 0;
+    bool stopping    = false;
+    std::vector<std::thread> workers;
 };
 
 class GrammarSession::Impl {
 public:
     Impl(const xgrammar::CompiledGrammar& grammar, int vocab)
-        : matcher(grammar), vocabulary(vocab), words((vocab + 31) / 32) {}
+        : matcher(std::in_place, grammar), vocabulary(vocab), words((vocab + 31) / 32) {}
 
-    xgrammar::GrammarMatcher matcher;
+    Impl(std::shared_future<DeferredGrammar> compile, int vocab)
+        : deferred(std::move(compile)), vocabulary(vocab), words((vocab + 31) / 32) {}
+
+    std::optional<xgrammar::GrammarMatcher> matcher;
+    // A deferred compile until the matcher exists (or the compile failed).
+    std::shared_future<DeferredGrammar> deferred;
+    std::exception_ptr failure;
     int vocabulary;
     std::size_t words;
-    int tentative = 0;
+    int tentative = 0; // tokens the matcher accepted since the last confirm (its rollback)
     std::unique_ptr<GrammarStateConstraint> companion;
     ConstraintObservation observed;
 
+    [[nodiscard]] bool pending() const noexcept {
+        return !matcher && !failure && deferred.valid() &&
+               deferred.wait_for(std::chrono::seconds(0)) != std::future_status::ready;
+    }
+
+    // The matcher, made from the deferred compile at first use (waiting for it); null if that
+    // compile failed.
+    xgrammar::GrammarMatcher* ready() {
+        if (matcher) { return &*matcher; }
+        if (failure || !deferred.valid()) { return nullptr; }
+        const auto started = std::chrono::steady_clock::now();
+        const bool waits   = pending();
+        try {
+            const DeferredGrammar& done = deferred.get();
+            matcher.emplace(done.grammar);
+            observed.cache = done.cache;
+            if (observed.timings_collected) { observed.compile_seconds = done.seconds; }
+        } catch (...) { failure = std::current_exception(); }
+        if (waits && observed.timings_collected) {
+            observed.wait_seconds +=
+                std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();
+        }
+        deferred = {};
+        return matcher ? &*matcher : nullptr;
+    }
+
+    // Advances by one token: the matcher, unless the companion takes the token as text, then the
+    // companion. Refused (nothing advanced): nullopt; else whether the matcher advanced.
+    std::optional<bool> advance(std::int32_t token) {
+        const bool literal = companion && companion->literal(token);
+        if (!literal && (matcher->IsTerminated() || !matcher->AcceptToken(token))) { return std::nullopt; }
+        if (companion && !companion->accept(token)) {
+            if (!literal) { matcher->Rollback(1); }
+            return std::nullopt;
+        }
+        return !literal;
+    }
+
     void fill(std::span<std::uint32_t> target) {
-        if (matcher.IsTerminated()) {
+        if (matcher->IsTerminated()) {
             std::fill(target.begin(), target.end(), 0);
             return;
         }
         std::int64_t shape[] = {1, static_cast<std::int64_t>(words)};
         DLTensor tensor{target.data(), {kDLCPU, 0}, 2, {kDLInt, 32, 1}, shape, nullptr, 0};
-        matcher.FillNextTokenBitmask(&tensor);
+        matcher->FillNextTokenBitmask(&tensor);
         if (vocabulary % 32) { target.back() &= (1u << (vocabulary % 32)) - 1u; }
         if (companion) { companion->filter(target); }
     }
 };
 
 GrammarCompiler::GrammarCompiler(std::vector<std::string> vocab, std::vector<std::int32_t> eos,
-                                 std::size_t bytes)
-    : impl_(std::make_unique<Impl>(std::move(vocab), std::move(eos), bytes)) {}
+                                 std::size_t bytes, std::vector<std::int32_t> reserved)
+    : impl_(std::make_unique<Impl>(std::move(vocab), std::move(eos), bytes, std::move(reserved))) {
+    for (const std::int32_t id : impl_->reserved) {
+        if (id < 0 || static_cast<std::size_t>(id) >= impl_->vocab->size() || (*impl_->vocab)[id].empty()) {
+            throw std::invalid_argument("a reserved grammar token needs a spelling in the vocabulary");
+        }
+    }
+}
 
 GrammarCompiler::~GrammarCompiler() = default;
 
@@ -256,25 +403,29 @@ GrammarCompiler::compile_model(std::string_view identity,
                                const std::function<xgrammar::Grammar()>& build,
                                const ReasoningFraming& reasoning,
                                std::span<const std::int32_t> continuation,
-                               std::unique_ptr<GrammarStateConstraint> companion) {
+                               std::unique_ptr<GrammarStateConstraint> companion, Compile mode) {
     const std::string key = "model:" + framing_key(reasoning) + std::string(identity);
-    xgrammar::CompilationCacheAccess access;
-    auto compiled = impl_->compiler.CompileCachedGrammar(
-        key,
-        [&] {
-            auto grammar = build();
-            return reasoning.close_token
-                       ? xgrammar::Grammar::Concat({reasoning_prefix(reasoning), grammar})
-                       : grammar;
-        },
-        &access);
-    auto session =
-        std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab->size()));
-    session->observed.cache = cache_access(access);
-    session->companion      = std::move(companion);
+    const auto framed     = [&] {
+        auto grammar = build();
+        return reasoning.close_token
+                   ? xgrammar::Grammar::Concat({reasoning_prefix(reasoning), grammar})
+                   : grammar;
+    };
+    const int vocabulary = static_cast<int>(impl_->vocab->size());
+    std::unique_ptr<GrammarSession::Impl> session;
+    if (mode == Compile::Deferred && continuation.empty() && !impl_->compiler.HasCachedGrammar(key)) {
+        session = std::make_unique<GrammarSession::Impl>(impl_->defer(key, framed(), std::nullopt),
+                                                         vocabulary);
+        session->observed.cache = ConstraintCacheAccess::Built;
+    } else {
+        xgrammar::CompilationCacheAccess access;
+        auto compiled = impl_->compiler.CompileCachedGrammar(key, framed, &access);
+        session       = std::make_unique<GrammarSession::Impl>(compiled, vocabulary);
+        session->observed.cache = cache_access(access);
+    }
+    session->companion = std::move(companion);
     for (const std::int32_t token : continuation) {
-        if (!session->matcher.AcceptToken(token) ||
-            (session->companion && !session->companion->accept(token)))
+        if (!session->advance(token))
             throw RequestError(RequestErrorKind::InvalidToolConstraint,
                                "assistant continuation is not a prefix of the tool grammar");
     }
@@ -284,7 +435,29 @@ GrammarCompiler::compile_model(std::string_view identity,
 
 std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint& constraint,
                                                          const ReasoningFraming& reasoning,
-                                                         std::string_view continuation) {
+                                                         std::string_view continuation,
+                                                         Compile mode) {
+    if (!reasoning.close_token) { return compile_content(constraint, framing_key(reasoning), {}, continuation, mode); }
+    return compile_content(
+        constraint, framing_key(reasoning),
+        [&](const xgrammar::Grammar& content) {
+            return xgrammar::Grammar::Concat({reasoning_prefix(reasoning), content});
+        },
+        continuation, mode);
+}
+
+std::unique_ptr<GrammarSession> GrammarCompiler::compile_framed(const OutputConstraint& constraint,
+                                                                const ContentFraming& framing,
+                                                                Compile mode) {
+    if (!framing.wrap) { throw std::invalid_argument("a content framing needs its wrap"); }
+    // "framed:" keeps these keys apart from the reasoning framings' ("-:" or a close token's id).
+    return compile_content(constraint, "framed:" + std::string(framing.key) + ":", framing.wrap, {}, mode);
+}
+
+std::unique_ptr<GrammarSession>
+GrammarCompiler::compile_content(const OutputConstraint& constraint, std::string_view framing,
+                                 const std::function<xgrammar::Grammar(const xgrammar::Grammar&)>& frame,
+                                 std::string_view continuation, Compile mode) {
     const auto error_kind = constraint_error_kind(constraint.kind);
     try {
         auto choices = constraint.choices;
@@ -297,37 +470,41 @@ std::unique_ptr<GrammarSession> GrammarCompiler::compile(const OutputConstraint&
             throw std::invalid_argument("literal alternatives require a choice constraint");
         }
         std::string key = std::to_string(static_cast<int>(constraint.kind)) + ":" +
-                          framing_key(reasoning) + constraint.source;
+                          std::string(framing) + constraint.source;
         for (const auto& value : choices) key += std::to_string(value.size()) + ":" + value;
+        const auto build = [&] {
+            auto grammar = [&]() -> xgrammar::Grammar {
+                if (constraint.kind == OutputConstraintKind::Grammar) {
+                    auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
+                    validate(parsed, *impl_->vocab, impl_->eos, impl_->reserved);
+                    if (!impl_->reserved.empty()) { parsed = ReservedExclusion(impl_->reserved).Apply(parsed); }
+                    return parsed;
+                } else if (constraint.kind == OutputConstraintKind::Choice) {
+                    return choice_grammar(choices);
+                } else if (constraint.kind == OutputConstraintKind::Regex) {
+                    validate_utf8(constraint.source);
+                    return xgrammar::GrammarNormalizer::Apply(
+                        ScalarRegex().Apply(xgrammar::Grammar::FromRegex(
+                            xgrammar::NormalizeRegexPattern(constraint.source, true))));
+                } else {
+                    return build_json_grammar(constraint);
+                }
+            }();
+            return frame ? frame(grammar) : grammar;
+        };
+        const int vocabulary = static_cast<int>(impl_->vocab->size());
+        if (mode == Compile::Deferred && continuation.empty() &&
+            !impl_->compiler.HasCachedGrammar(key)) {
+            auto session = std::make_unique<GrammarSession::Impl>(
+                impl_->defer(key, build(), error_kind), vocabulary);
+            session->observed.cache = ConstraintCacheAccess::Built;
+            return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
+        }
         xgrammar::CompilationCacheAccess access;
-        auto compiled = impl_->compiler.CompileCachedGrammar(
-            key,
-            [&] {
-                auto grammar = [&]() -> xgrammar::Grammar {
-                    if (constraint.kind == OutputConstraintKind::Grammar) {
-                        auto parsed = xgrammar::Grammar::FromEBNF(constraint.source, "root");
-                        validate(parsed, *impl_->vocab, impl_->eos);
-                        return parsed;
-                    } else if (constraint.kind == OutputConstraintKind::Choice) {
-                        return choice_grammar(choices);
-                    } else if (constraint.kind == OutputConstraintKind::Regex) {
-                        validate_utf8(constraint.source);
-                        return xgrammar::GrammarNormalizer::Apply(
-                            ScalarRegex().Apply(xgrammar::Grammar::FromRegex(
-                                xgrammar::NormalizeRegexPattern(constraint.source, true))));
-                    } else {
-                        return build_json_grammar(constraint);
-                    }
-                }();
-                if (reasoning.close_token)
-                    grammar = xgrammar::Grammar::Concat({reasoning_prefix(reasoning), grammar});
-                return grammar;
-            },
-            &access);
-        auto session =
-            std::make_unique<GrammarSession::Impl>(compiled, static_cast<int>(impl_->vocab->size()));
+        auto compiled = impl_->compiler.CompileCachedGrammar(key, build, &access);
+        auto session  = std::make_unique<GrammarSession::Impl>(compiled, vocabulary);
         session->observed.cache = cache_access(access);
-        if (!continuation.empty() && !session->matcher.AcceptString(std::string(continuation))) {
+        if (!continuation.empty() && !session->matcher->AcceptString(std::string(continuation))) {
             throw std::invalid_argument("assistant continuation is not a prefix of the grammar");
         }
         return std::unique_ptr<GrammarSession>(new GrammarSession(std::move(session)));
@@ -362,14 +539,25 @@ std::uint64_t GrammarSession::masks(std::span<const std::int32_t> drafts,
         words.size() != (drafts.size() + 1) * impl_->words) {
         throw std::logic_error("invalid grammar lookahead transaction");
     }
+    // A deferred compile is waited for here, outside the mask work's time.
+    xgrammar::GrammarMatcher* const matcher = impl_->ready();
     WorkTimer timer(impl_->observed.timings_collected, impl_->observed.mask_seconds);
+    if (matcher == nullptr) {
+        // The deferred compile failed: no position has a legal token (safe nonempty device masks).
+        for (std::size_t position = 0; position <= drafts.size(); ++position) {
+            auto mask = words.subspan(position * impl_->words, impl_->words);
+            std::fill(mask.begin(), mask.end(), 0);
+            mask[0] = 1;
+        }
+        return 1;
+    }
     int advanced       = 0;
     bool reachable     = true;
     std::uint64_t dead = 0;
     try {
         for (std::size_t position = 0; position <= drafts.size(); ++position) {
             auto mask = words.subspan(position * impl_->words, impl_->words);
-            if (reachable && !impl_->matcher.IsTerminated()) {
+            if (reachable && !matcher->IsTerminated()) {
                 impl_->fill(mask);
                 ++impl_->observed.mask_positions;
                 if (std::all_of(mask.begin(), mask.end(), [](auto word) { return word == 0; })) {
@@ -384,22 +572,23 @@ std::uint64_t GrammarSession::masks(std::span<const std::int32_t> drafts,
             if (position == drafts.size()) { break; }
             // Rejected proposals are expected; advance only through the allowed token set.
             const auto draft = drafts[position];
-            if (reachable && !impl_->matcher.IsTerminated() && draft >= 0 &&
-                draft < impl_->vocabulary && (mask[draft / 32] & (1u << (draft % 32))) != 0 &&
-                impl_->matcher.AcceptToken(draft)) {
-                ++advanced;
-                // The filtered mask admitted the draft, so the companion follows it.
-                if (impl_->companion && !impl_->companion->accept(draft)) { reachable = false; }
-            } else {
+            std::optional<bool> moved;
+            if (reachable && !matcher->IsTerminated() && draft >= 0 && draft < impl_->vocabulary &&
+                (mask[draft / 32] & (1u << (draft % 32))) != 0) {
+                moved = impl_->advance(draft);
+            }
+            if (!moved) {
                 reachable = false;
+            } else if (*moved) {
+                ++advanced;
             }
         }
     } catch (...) {
-        if (advanced) { impl_->matcher.Rollback(advanced); }
+        if (advanced) { matcher->Rollback(advanced); }
         if (impl_->companion) { impl_->companion->discard(); }
         throw;
     }
-    if (advanced) { impl_->matcher.Rollback(advanced); }
+    if (advanced) { matcher->Rollback(advanced); }
     // No token was tentative on entry, so the committed state is the one the lookahead began at.
     if (impl_->companion) { impl_->companion->discard(); }
     return dead;
@@ -408,13 +597,14 @@ std::uint64_t GrammarSession::masks(std::span<const std::int32_t> drafts,
 void GrammarSession::accept(std::int32_t token) { accept(std::span(&token, 1)); }
 
 void GrammarSession::accept(std::span<const std::int32_t> tokens) {
+    if (impl_->ready() == nullptr) {
+        throw std::logic_error("a token was selected for a grammar whose compile failed");
+    }
     WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
     for (const auto token : tokens) {
-        if (impl_->matcher.IsTerminated() || !impl_->matcher.AcceptToken(token))
-            throw std::logic_error("selected token violates the request grammar");
-        ++impl_->tentative;
-        if (impl_->companion && !impl_->companion->accept(token))
-            throw std::logic_error("selected token violates the request grammar");
+        const std::optional<bool> moved = impl_->advance(token);
+        if (!moved) throw std::logic_error("selected token violates the request grammar");
+        if (*moved) ++impl_->tentative;
     }
 }
 
@@ -429,11 +619,18 @@ void GrammarSession::uploaded(std::size_t bytes) noexcept {
 
 ConstraintObservation GrammarSession::observation() const {
     if (impl_->tentative) throw std::logic_error("cannot publish tentative grammar state");
+    // A finished deferred compile is taken up without waiting; one still running (a request that
+    // ended before its first token) reports nothing generated.
+    const xgrammar::GrammarMatcher* const matcher = impl_->pending() ? nullptr : impl_->ready();
     auto result       = impl_->observed;
-    result.terminated = impl_->matcher.IsTerminated();
-    result.complete   = result.terminated || impl_->matcher.IsCompleted();
+    result.terminated = matcher != nullptr && matcher->IsTerminated();
+    result.complete   = result.terminated || (matcher != nullptr && matcher->IsCompleted());
     return result;
 }
+
+bool GrammarSession::pending() const noexcept { return impl_->pending(); }
+
+std::exception_ptr GrammarSession::failure() const noexcept { return impl_->failure; }
 
 void GrammarSession::confirm() noexcept {
     impl_->tentative = 0;
@@ -442,7 +639,8 @@ void GrammarSession::confirm() noexcept {
 
 void GrammarSession::discard() {
     WorkTimer timer(impl_->observed.timings_collected, impl_->observed.matcher_seconds);
-    if (impl_->tentative) { impl_->matcher.Rollback(impl_->tentative); }
+    // Tokens are tentative only on a matcher that exists.
+    if (impl_->tentative) { impl_->matcher->Rollback(impl_->tentative); }
     impl_->tentative = 0;
     if (impl_->companion) { impl_->companion->discard(); }
 }

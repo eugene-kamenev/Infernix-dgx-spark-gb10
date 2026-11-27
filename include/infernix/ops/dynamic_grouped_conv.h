@@ -13,8 +13,8 @@ namespace infernix::ops {
 
 /**
  * Returns the transient capacity required by rmsnorm_dynamic_grouped_conv_prepare at hidden width
- * H (5120 or 2560) for every width/batch pair in the inclusive intervals. Width endpoints lie in
- * [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the requested
+ * H (5120, 2560, 3072 or 2304) for every width/batch pair in the inclusive intervals. Width endpoints lie
+ * in [2,16], batch endpoints in [1,8]. Capacity covers every shape-selected route in the requested
  * domain.
  */
 [[nodiscard]] std::size_t rmsnorm_dynamic_grouped_conv_prepare_workspace_capacity_bytes(
@@ -70,13 +70,13 @@ void rmsnorm_dynamic_grouped_conv_prepare(const Tensor& residual, const Tensor& 
 
 /**
  * Returns the transient capacity required by linear_dynamic_grouped_conv_add for every width/batch
- * pair in the inclusive intervals. (hidden, input_rows) is (5120, 4096|17408) or (2560,
- * 4096|7680), widths lie in [2,16], and batch sizes in [1,8]. Capacity follows every
- * shape-selected production route.
+ * pair in the inclusive intervals. (hidden, input_rows) is (5120, 4096|17408), (2560,
+ * 4096|7680), (3072, 4096|9216) or (2304, 4096|6912), widths lie in [2,16], and batch sizes in [1,8]. Capacity follows every
+ * shape-selected production route of a projection_weight in `qtype` (Q8_G32_FP16, or NVFP4 at (2304, 6912)).
  */
 [[nodiscard]] std::size_t linear_dynamic_grouped_conv_add_workspace_capacity_bytes(
     std::int32_t hidden, std::int32_t input_rows, std::int32_t min_width, std::int32_t max_width,
-    std::int32_t min_batch_size, std::int32_t max_batch_size);
+    std::int32_t min_batch_size, std::int32_t max_batch_size, QType qtype = QType::Q8_G32_FP16);
 
 /**
  * Op: linear_dynamic_grouped_conv_add

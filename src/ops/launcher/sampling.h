@@ -13,7 +13,11 @@ namespace infernix::ops::detail {
 
 void sample_batch_launch(const Tensor& logits, Tensor& out, std::int32_t token_domain,
                          const SamplingConfig* configs, const Tensor& logical_positions,
-                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream);
+                         std::int32_t purpose, DeviceSpan workspace, cudaStream_t stream,
+                         bool full_vocabulary_rows = false);
+
+void increment_licensed_token_counts_launch(const Tensor& licensed_tokens, const Tensor& licensed_counts,
+                                            const SamplingConfig* configs, cudaStream_t stream);
 
 void sample_compact_launch(const Tensor& compact_ids, const Tensor& compact_logits,
                            const Tensor& compact_counts, Tensor& out, std::int32_t token_domain,

@@ -6,6 +6,7 @@ target_sources(infernix_model_loading PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/expert_bank.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/expert_store.cpp"
   "${CMAKE_CURRENT_LIST_DIR}/memory_plan.cpp"
+  "${CMAKE_CURRENT_LIST_DIR}/ram_monitor.cpp"
 )
 
 target_sources(infernix_model_runtime PRIVATE

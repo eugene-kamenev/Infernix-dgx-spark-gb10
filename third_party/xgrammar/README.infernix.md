@@ -6,13 +6,18 @@ under the Apache License 2.0; see [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 Infernix owns the CMake target and maintains its adaptations here, adopting upstream changes
 selectively. Cold compilation is limited to two concurrent callers per compiler; the adapter
-uses one caller thread per compile, without creating a thread pool. Python/TVM bindings, GPU kernels,
+calls each compile from one thread (a submit thread, or one of its two compile workers), and the
+library computes that compile's adaptive token masks on its own thread pool (`max_threads`, a quarter
+of the hardware threads up to 8, from `text/grammar.cpp`; the rule-level cache is sharded under
+mutexes). Python/TVM bindings, GPU kernels,
 Web code, upstream tests and build machinery are excluded.
 
 Grammar string escaping preserves embedded NUL bytes, including in compilation cache keys.
 The prepared-grammar cache shares one budget and single-flight mechanism across GBNF and JSON;
 its miss factory covers validation, conversion and output framing within the cold-compile limit.
-Cache access reports hit, build or an in-flight wait to the caller without adding another cache.
+Cache access reports hit, build or an in-flight wait to the caller without adding another cache;
+`HasCachedGrammar` tells whether a key has an entry (ready or in flight) without building, so the
+adapter can validate a miss's grammar on the submit thread and compile it on a worker.
 JSON adaptations preserve literal data in cache keys, reject unsupported unions, resolve local
 JSON Pointers and carry typed errors with schema locations. String grammars constrain decoded
 Unicode values before JSON encoding; property-name exclusion also covers escaped spellings.
@@ -34,7 +39,10 @@ Regex and schema patterns share character/escape normalization with explicit ful
 regex hexadecimal escapes consume exactly two digits. Product constraints reject unsupported
 escapes and anchor positions before grammar conversion.
 The Qwen converter uses canonical tool framing, preserves raw-string assertions with delimiter
-exclusion, and emits argument numbers that the protocol JSON adapters can represent.
+exclusion, and emits argument numbers that the protocol JSON adapters can represent. Its raw string
+also holds the whole call's closing lines when more value text follows them, and, with
+`JSONSchemaToGrammar`'s `quoted_parameter_lines`, a `\n</parameter>\n<parameter=NAME>` line; the
+matcher keeps both readings and Infernix's decoder decides.
 
 The CPU dependency closure includes Lark and all format converters referenced by the shared
 factories. `cpp/testing.cc` also supplies token-formatting diagnostics used by the matcher and

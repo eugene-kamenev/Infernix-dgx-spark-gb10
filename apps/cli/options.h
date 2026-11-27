@@ -15,6 +15,8 @@ struct Options {
     bool help_requested = false;
 
     std::filesystem::path artifact_path;
+    std::filesystem::path lora_path;
+    std::filesystem::path ablate_sidecar_path;
     std::filesystem::path chat_template_path;
     std::filesystem::path ngram_volume_path;
     NgramResidency ngram_residency  = NgramResidency::Auto;
@@ -42,12 +44,16 @@ struct Options {
     std::optional<std::size_t> vram_headroom_bytes; // empty: the model's automatic headroom
     std::uint32_t expert_tail_skip = 0; // EngineOptions::expert_tail_skip
     bool expert_a4_activations     = false; // EngineOptions::expert_a4_activations
+    bool expert_a16_activations    = false; // EngineOptions::expert_a16_activations
     bool a8_activations            = false; // EngineOptions::a8_activations
+    bool q8_weights                = false; // EngineOptions::q8_weights
+    bool w4_weights                = false; // EngineOptions::w4_weights
     bool embedding_host            = false; // EngineOptions::embedding_host
     std::uint32_t prefill_chunk  = 0; // 0: the model's default (EngineOptions)
     int device                   = 0;
 
     KvCacheStorage kv_cache = KvCacheStorage::BFloat16;
+    std::optional<KvCacheStorage> kv_window_cache;
     LogitsDtype logits_dtype = LogitsDtype::FP32;
     // INT8 KV prefills with the fast prompt kernel unless the original kernel is selected.
     bool original_int8_prefill_kernel = false;

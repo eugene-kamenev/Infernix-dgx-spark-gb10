@@ -160,6 +160,8 @@ struct RequestRecord {
         return model_state == EngineRequestState::ModelFinished;
     }
 
+    [[nodiscard]] bool is_decision() const noexcept { return options.decision; }
+
     // The process range follows Request ownership across submit, worker, and consumer threads.
     nvtx::ScopedAsyncRange generation_range;
     const std::uint64_t id;
@@ -177,10 +179,12 @@ struct RequestRecord {
     std::optional<Clock::time_point> admitted_at;
     std::optional<Clock::time_point> first_token;
     std::optional<Clock::time_point> last_token;
+    std::optional<Clock::time_point> last_progress;
     bool queue_wait_recorded = false;
     std::optional<GenerationBudget> budget;
     std::optional<BeginSummary> admitted_begin;
     std::optional<BeginSummary> begin;
+    std::uint32_t cached_block_tokens = 0;
     std::vector<TokenId> generated;
     std::string content;
     std::string reasoning;
@@ -227,6 +231,7 @@ struct RequestRecord {
     std::condition_variable cv;
     std::optional<GenerationStart> stream_start;
     std::optional<PromptProgress> stream_progress;
+    std::optional<GenerationProgressObservation> live_progress;
     std::vector<StreamEvent> events;
     GenerationResult result;
     std::exception_ptr error;

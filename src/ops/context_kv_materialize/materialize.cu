@@ -29,6 +29,7 @@ struct DeviceLayerView {
     __nv_bfloat16* cache_k;
     __half* cache_v;
     std::int32_t padded_capacity;
+    std::int32_t capacity_mask;
 };
 
 struct DeviceLayers {
@@ -60,8 +61,8 @@ __device__ __forceinline__ void store_key_head(const float* input, const DeviceL
     float sin0, cos0, sin1, cos1;
     rope_sincos(layers, positions, column, j, &sin0, &cos0);
     rope_sincos(layers, positions, column, j + 1, &sin1, &cos1);
-    const auto dst = 128LL * ((positions[column] & 2047) + (long long)layer.padded_capacity *
-                                                               (head + 8 * slots[column / width]));
+    const auto dst = 128LL * ((positions[column] & layer.capacity_mask) +
+                              (long long)layer.padded_capacity * (head + 8 * slots[column / width]));
     auto* out      = reinterpret_cast<__nv_bfloat162*>(layer.cache_k + dst);
     out[lane]      = __floats2bfloat162_rn(x0 * cos0 - y0 * sin0, x1 * cos1 - y1 * sin1);
     out[lane + 32] = __floats2bfloat162_rn(y0 * cos0 + x0 * sin0, y1 * cos1 + x1 * sin1);
@@ -375,7 +376,7 @@ __global__ __launch_bounds__(Rows / 16 * ColumnWarps * 32, 1) void context_kv_mm
                 key_scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] =
                     result;
             } else {
-                const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
+                const auto dst     = row % 128 + 128LL * ((positions[column] & layer.capacity_mask) +
                                                       (long long)layer.padded_capacity *
                                                           (row / 128 + 8 * slots[request]));
                 layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
@@ -426,7 +427,7 @@ struct MaterializeProjectionEpilogue {
         if (!value)
             scratch[row + 1024LL * (packed_column + max_count * batch * layer_index)] = result;
         else {
-            const auto dst     = row % 128 + 128LL * ((positions[column] & 2047) +
+            const auto dst     = row % 128 + 128LL * ((positions[column] & layer.capacity_mask) +
                                                   (long long)layer.padded_capacity *
                                                       (row / 128 + 8 * slots[request]));
             layer.cache_v[dst] = __float2half_rn(__bfloat162float(__float2bfloat16_rn(result)));
@@ -534,6 +535,7 @@ DeviceLayers make_device_layers(std::span<const ContextKVMaterializeLayerView> l
             static_cast<__nv_bfloat16*>(source.cache.k.data),
             static_cast<__half*>(source.cache.v.data),
             static_cast<std::int32_t>(source.cache.padded_capacity),
+            static_cast<std::int32_t>(source.cache.capacity - 1U),
         };
     }
     return result;
@@ -548,14 +550,15 @@ bool launch_projection(const Tensor& context, const Tensor& positions, const Ten
                        ContextKVMaterializeRoute route, const Tensor& key_scratch,
                        cudaStream_t stream) {
     using Route = ContextKVMaterializeRoute;
+    constexpr int kGroupedWarps = H % 512 == 0 ? 8 : 4;
     switch (route) {
     case Route::KSplit16:
-        launch_grouped<H, 16>(context, positions, counts, state_slots, device_layers, envelope,
-                              key_scratch, stream);
+        launch_grouped<H, 16, kGroupedWarps>(context, positions, counts, state_slots, device_layers,
+                                             envelope, key_scratch, stream);
         return true;
     case Route::KSplit24:
-        launch_grouped<H, 24>(context, positions, counts, state_slots, device_layers, envelope,
-                              key_scratch, stream);
+        launch_grouped<H, 24, kGroupedWarps>(context, positions, counts, state_slots, device_layers,
+                                             envelope, key_scratch, stream);
         return true;
     case Route::Mma32:
         launch_mma<H, 64, 32, 128, 2, false, true>(
@@ -599,6 +602,7 @@ void context_kv_materialize_launch(
     };
     const bool post = context.ne[0] == 5120   ? project.template operator()<5120>()
                       : context.ne[0] == 3072 ? project.template operator()<3072>()
+                      : context.ne[0] == 2304 ? project.template operator()<2304>()
                                               : project.template operator()<2560>();
     if (!post) { return; }
     CUDA_CHECK(pdl::launch_consumer(

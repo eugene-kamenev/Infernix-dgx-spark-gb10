@@ -19,6 +19,8 @@ namespace infernix::runtime {
 // Everything the bytes of a persisted hybrid Host tier depend on besides its geometry (which the
 // file records itself); a different value makes a saved file meaningless.
 [[nodiscard]] std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature);
+[[nodiscard]] std::string hybrid_cache_fingerprint(const EngineOptions& options, const std::string& signature,
+                                                   const cudaDeviceProp& device);
 
 // `offloaded_experts`: a Qwen3.5 artifact whose MoE layers offload their routed experts
 // (artifact_offloads_experts), whose defaults follow Qwen3.8-Flash-Next's.

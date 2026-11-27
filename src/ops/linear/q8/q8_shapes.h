@@ -11,6 +11,7 @@ using Q8N1024K5120   = Q8LinearGeometry<1024, 5120>;
 using Q8N2048K4096   = Q8LinearGeometry<2048, 4096>;
 using Q8N2048K4608   = Q8LinearGeometry<2048, 4608>;
 using Q8N2048K16384  = Q8LinearGeometry<2048, 16384>;
+using Q8N2304K9216   = Q8LinearGeometry<2304, 9216>;
 using Q8N2560K6144   = Q8LinearGeometry<2560, 6144>;
 using Q8N4608K4608   = Q8LinearGeometry<4608, 4608>;
 using Q8N5120K4608   = Q8LinearGeometry<5120, 4608>;
@@ -106,5 +107,7 @@ void launch_q8_n16384_k2560_conv_snapshot(const Tensor& x, const Weight& weight,
 [[nodiscard]] Q8Launch select_q8_n13952_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n16384_k2560_invariant(std::int32_t tokens);
 [[nodiscard]] Q8Launch select_q8_n2560_k12800_invariant(std::int32_t tokens);
+// Inkling 2 Mini DFlash2 feature projection (four taps of 2304).
+[[nodiscard]] Q8Launch select_q8_n2304_k9216(std::int32_t tokens);
 
 } // namespace infernix::ops::detail

@@ -4,6 +4,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <exception>
 #include <functional>
 #include <memory>
 #include <optional>
@@ -23,23 +24,36 @@ namespace infernix::text {
 // The model's reasoning ahead of a constrained output: any tokens but the close token, then that
 // token and the fixed separator bytes the output starts after. Only the close token's identity
 // ends the reasoning, never its spelling in ordinary tokens. Without a close token the output
-// starts at once.
+// starts at once. `withheld_token` is a token the reasoning may not write either: a Qwen tool
+// grammar withholds `<tool_call>`, since a call written there never runs and the reasoning, which
+// cannot end the turn, would go on to its budget.
 struct ReasoningFraming {
     std::optional<std::int32_t> close_token;
     std::string_view separator;
-    // Optional token forbidden inside the reasoning phase (e.g. `<tool_call>` when tool grammar
-    // is active), so the model must emit `close_token` before opening a tool call.
-    std::optional<std::int32_t> excluded_token;
+    std::optional<std::int32_t> withheld_token;
 };
 
-// A request's companion to its grammar for a rule the context-free grammar cannot express (Qwen
-// tool calls: a parameter name used once per call). It reads the tokens the matcher accepts and
-// refuses tokens from its own state; the session keeps both in one transaction.
+// A model's turn around a content constraint when its framing is a token-level grammar (Inkling 2's blocks):
+// `wrap` receives the constraint's grammar and returns the whole turn's; `key` identifies the wrap in the compile
+// cache (the same key must always wrap the same way).
+struct ContentFraming {
+    std::string_view key;
+    std::function<xgrammar::Grammar(const xgrammar::Grammar&)> wrap;
+};
+
+// A request's companion to its grammar for rules the context-free grammar cannot express (Qwen
+// tool calls: a parameter name used once per call; a call token quoted in Markdown code is text).
+// It reads the tokens the matcher accepts and refuses tokens from its own state; the session keeps
+// both in one transaction.
 class GrammarStateConstraint {
 public:
     virtual ~GrammarStateConstraint() = default;
     // Clears the bits of the tokens refused in the current state.
     virtual void filter(std::span<std::uint32_t> mask) = 0;
+    // Whether `token` is text the matcher does not see in the current state: the session advances
+    // only the companion with it. Only a token the matcher admits there (a token-level dispatch tag
+    // of free text) may be one, so the masks stay the matcher's.
+    [[nodiscard]] virtual bool literal(std::int32_t /*token*/) const noexcept { return false; }
     // Advances by one token; false (state unchanged) when the token is refused.
     [[nodiscard]] virtual bool accept(std::int32_t token) = 0;
     // The current state becomes the committed one; discard() returns to it.
@@ -47,15 +61,23 @@ public:
     virtual void discard() noexcept = 0;
 };
 
-// One immutable vocabulary/compiler per model; one transactional matcher per request.
+// One immutable vocabulary/compiler per model; one transactional matcher per request. A session
+// from a deferred compile (GrammarCompiler::Compile::Deferred) creates its matcher at first use,
+// waiting for the compile there; until the compile ends it is pending().
 class GrammarSession {
 public:
     ~GrammarSession();
     GrammarSession(GrammarSession&&) noexcept;
     GrammarSession& operator=(GrammarSession&&) noexcept;
-    // Returns one dead-end bit per position; at most 63 drafts plus the bonus position.
+    // Returns one dead-end bit per position; at most 63 drafts plus the bonus position. A deferred
+    // compile that failed leaves every position dead (bit 0 set), so the request fails at its first
+    // position with failure() as the reason, as for any dead end.
     [[nodiscard]] std::uint64_t masks(std::span<const std::int32_t> drafts,
                                       std::span<std::uint32_t> words);
+    // Whether a deferred compile is still running (masks() would wait for it).
+    [[nodiscard]] bool pending() const noexcept;
+    // A deferred compile's error, once masks() met it; null otherwise.
+    [[nodiscard]] std::exception_ptr failure() const noexcept;
     void accept(std::int32_t token);
     void accept(std::span<const std::int32_t> tokens);
     void confirm() noexcept;
@@ -74,27 +96,53 @@ private:
 
 class GrammarCompiler {
 public:
+    // Now: the call compiles (or takes the cached grammar) and returns a ready session. Deferred: on
+    // a cache miss without continuation, the call still builds and validates the grammar, so every
+    // request error is still the call's, and only the token-mask compile, the slow part, runs on
+    // one of the compiler's two workers; the session waits for it at its first use. A hit, a
+    // continuation (which must be checked against the grammar now) or a key another request is
+    // compiling take the Now path.
+    enum class Compile : std::uint8_t { Now, Deferred };
+
     // Empty entries explicitly identify forbidden/special IDs. EOS is supplied separately.
+    // `reserved`: a model's protocol tokens that its own grammars name with Token() (each spelled
+    // with bytes no byte-level rule can match, as Inkling 2's markers are). A request's GBNF may not
+    // name them, and its ExcludeToken free text excludes them too, so a content constraint never
+    // writes the model's framing.
     GrammarCompiler(std::vector<std::string> vocabulary, std::vector<std::int32_t> eos,
-                    std::size_t cache_bytes);
+                    std::size_t cache_bytes, std::vector<std::int32_t> reserved = {});
+    // Joins the workers after their running compiles; a queued compile fails its session.
     ~GrammarCompiler();
     // `continuation` is an assistant prefix the matcher accepts as bytes.
     [[nodiscard]] std::unique_ptr<GrammarSession> compile(const OutputConstraint& constraint,
                                                           const ReasoningFraming& reasoning,
-                                                          std::string_view continuation);
+                                                          std::string_view continuation,
+                                                          Compile mode = Compile::Now);
+    // The constraint inside a model's token-level framing (no continuation).
+    [[nodiscard]] std::unique_ptr<GrammarSession> compile_framed(const OutputConstraint& constraint,
+                                                                 const ContentFraming& framing,
+                                                                 Compile mode = Compile::Now);
     // Model-owned composition, built only on a miss in the same bounded compiler cache. A model
     // grammar may hold token-level terminals, so its continuation is accepted as tokens, by the
     // companion (if any) as well.
     [[nodiscard]] std::unique_ptr<GrammarSession>
     compile_model(std::string_view identity, const std::function<xgrammar::Grammar()>& build,
                   const ReasoningFraming& reasoning, std::span<const std::int32_t> continuation,
-                  std::unique_ptr<GrammarStateConstraint> companion = {});
+                  std::unique_ptr<GrammarStateConstraint> companion = {},
+                  Compile mode = Compile::Now);
     // Each token's bytes (empty for special and invalid ids), shared with companions.
     [[nodiscard]] const std::shared_ptr<const std::vector<std::string>>& vocabulary() const noexcept;
     // The tokens whose bytes contain '>' (ascending): the only ones that can end a tag.
     [[nodiscard]] const std::shared_ptr<const std::vector<std::int32_t>>& tag_end_tokens() const noexcept;
 
 private:
+    // Both compile() forms: the constraint's grammar, `frame` applied to it (none: as is), cached
+    // under the constraint and `framing_key`.
+    [[nodiscard]] std::unique_ptr<GrammarSession>
+    compile_content(const OutputConstraint& constraint, std::string_view framing_key,
+                    const std::function<xgrammar::Grammar(const xgrammar::Grammar&)>& frame,
+                    std::string_view continuation, Compile mode);
+
     class Impl;
     std::unique_ptr<Impl> impl_;
 };

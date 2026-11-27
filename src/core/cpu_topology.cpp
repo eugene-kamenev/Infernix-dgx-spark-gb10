@@ -250,4 +250,23 @@ std::vector<int> performance_cpus() {
 }
 
 } // namespace core
+
+std::uint64_t slow_core_cpus() {
+    static const std::uint64_t slow = [] {
+        const std::vector<PhysicalCore> cores = physical_cores();
+        if (cores.empty()) { return std::uint64_t{0}; }
+        std::uint8_t lowest = 255, highest = 0;
+        for (const PhysicalCore& core : cores) {
+            lowest  = std::min(lowest, core.efficiency);
+            highest = std::max(highest, core.efficiency);
+        }
+        std::uint64_t mask = 0;
+        if (lowest != highest) {
+            for (const PhysicalCore& core : cores) { mask |= core.efficiency == lowest ? core.cpus : 0; }
+        }
+        return mask;
+    }();
+    return slow;
+}
+
 } // namespace infernix

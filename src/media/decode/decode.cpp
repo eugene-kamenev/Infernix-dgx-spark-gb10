@@ -1,5 +1,8 @@
 #include "media/decode/decode.h"
 #include "media/decode/jpeg_decode.h"
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
+#include "media/decode/png_decode.h"
+#endif
 
 extern "C" {
 #include <libavcodec/avcodec.h>
@@ -45,12 +48,65 @@ std::string av_error(int code) {
     throw Error(ErrorKind::InvalidInput, std::move(message));
 }
 
+// Animated WebP's codec id (AV_CODEC_ID_WEBP_ANIM, FFmpeg 8: libavcodec 62+), looked up by its descriptor's name:
+// the libavcodec 60 the build accepts (Ubuntu 24.04's FFmpeg 6.1) has no such id. AV_CODEC_ID_NONE there.
+AVCodecID webp_anim_id() {
+    static const AVCodecID id = [] {
+        const AVCodecDescriptor* descriptor = avcodec_descriptor_get_by_name("webp_anim");
+        return descriptor != nullptr ? descriptor->id : AV_CODEC_ID_NONE;
+    }();
+    return id;
+}
+
+// Whether `id` is WebP's, still or animated.
+bool webp_codec(AVCodecID id) { return id == AV_CODEC_ID_WEBP || (webp_anim_id() != AV_CODEC_ID_NONE && id == webp_anim_id()); }
+
+// An extended WebP whose VP8X header sets the animation flag (RIFF, size, "WEBP", "VP8X", size, flags).
+bool is_animated_webp(std::span<const std::uint8_t> bytes) {
+    return bytes.size() >= 21 && std::memcmp(bytes.data(), "RIFF", 4) == 0 && std::memcmp(bytes.data() + 8, "WEBPVP8X", 8) == 0 &&
+           (bytes[20] & 0x02) != 0;
+}
+
+// FFmpeg before 8 skips an animated WebP's frames and reports invalid data: say what it lacks instead.
+void refuse_unsupported_animated_webp(std::span<const std::uint8_t> bytes) {
+    if (!is_animated_webp(bytes) || animated_webp_supported()) { return; }
+    const unsigned version = avcodec_version();
+    throw_invalid_media("animated WebP needs FFmpeg 8 (libavcodec 62 or newer) to decode; this build has libavcodec " +
+                        std::to_string(version >> 16) + "." + std::to_string((version >> 8) & 0xffU) +
+                        " (a still WebP, PNG, JPEG or GIF works)");
+}
+
 void validate_input(std::span<const std::uint8_t> bytes, const Policy& policy) {
     if (policy.max_bytes == 0) { throw std::invalid_argument("media byte limit must be positive"); }
     if (bytes.empty()) { throw_invalid_media("media bytes are empty"); }
     if (bytes.size() > policy.max_bytes) {
         throw Error(ErrorKind::BudgetExceeded, "media bytes exceed byte limit");
     }
+}
+
+constexpr std::string_view kRawRgbMagic = "IFXRGB24";
+
+bool is_raw_rgb(std::span<const std::uint8_t> bytes) noexcept {
+    return bytes.size() >= kRawRgbHeaderBytes &&
+           std::equal(kRawRgbMagic.begin(), kRawRgbMagic.end(), bytes.begin(),
+                      [](char expected, std::uint8_t actual) { return static_cast<std::uint8_t>(expected) == actual; });
+}
+
+std::uint32_t read_le32(std::span<const std::uint8_t> bytes, std::size_t offset) noexcept {
+    return static_cast<std::uint32_t>(bytes[offset]) | static_cast<std::uint32_t>(bytes[offset + 1]) << 8U |
+           static_cast<std::uint32_t>(bytes[offset + 2]) << 16U | static_cast<std::uint32_t>(bytes[offset + 3]) << 24U;
+}
+
+ImageInfo raw_rgb_info(std::span<const std::uint8_t> bytes, std::uint64_t max_decoded_pixels) {
+    const std::uint32_t width  = read_le32(bytes, 8);
+    const std::uint32_t height = read_le32(bytes, 12);
+    if (width == 0 || height == 0 || width > 65'536 || height > 65'536) {
+        throw_invalid_media("raw RGB image has invalid dimensions");
+    }
+    const std::uint64_t pixels = std::uint64_t{width} * height;
+    if (pixels > max_decoded_pixels) { throw Error(ErrorKind::BudgetExceeded, "raw RGB image exceeds pixel limit"); }
+    if (bytes.size() != kRawRgbHeaderBytes + pixels * 3U) { throw_invalid_media("raw RGB image has the wrong size"); }
+    return ImageInfo{.width = static_cast<int>(width), .height = static_cast<int>(height)};
 }
 
 int exif_orientation(std::span<const std::uint8_t> bytes) {
@@ -121,6 +177,8 @@ Image apply_orientation(Image image, int orientation) {
     rotated.width  = swap ? height : width;
     rotated.height = swap ? width : height;
     rotated.rgb.resize(image.rgb.size());
+    rotated.alpha.resize(image.alpha.size());
+    const bool alpha = !image.alpha.empty();
     for (int y = 0; y < height; ++y) {
         for (int x = 0; x < width; ++x) {
             int rx = 0;
@@ -147,12 +205,71 @@ Image apply_orientation(Image image, int orientation) {
                 rx = y;
                 ry = width - 1 - x;
             }
-            const std::size_t src = (static_cast<std::size_t>(y) * width + x) * 3;
-            const std::size_t dst = (static_cast<std::size_t>(ry) * rotated.width + rx) * 3;
-            std::copy_n(image.rgb.data() + src, 3, rotated.rgb.data() + dst);
+            const std::size_t src = static_cast<std::size_t>(y) * width + x;
+            const std::size_t dst = static_cast<std::size_t>(ry) * rotated.width + rx;
+            std::copy_n(image.rgb.data() + 3 * src, 3, rotated.rgb.data() + 3 * dst);
+            if (alpha) { rotated.alpha[dst] = image.alpha[src]; }
         }
     }
     return rotated;
+}
+
+// libwebp's RGB output, which Pillow's WebP decoder returns, from a lossy WebP frame's 4:2:0 planes. VP8 decoding
+// is bit-exact, so FFmpeg's planes are libwebp's; libwebp then interpolates chroma with its fancy upsampler (chroma
+// centred between luma pairs, 9/3/3/1 weights in its own integer rounding, edges repeated) and converts with 14-bit
+// BT.601 limited-range arithmetic. Repeating both gives Pillow's pixels, as the JPEG path does through libjpeg; swscale
+// differed by up to 82 per channel on a textured image (candidates MJ-01).
+int webp_clip8(int value) {
+    constexpr int kMask = (256 << 6) - 1;
+    return (value & ~kMask) == 0 ? value >> 6 : (value < 0 ? 0 : 255);
+}
+
+int webp_mult_hi(int value, int coefficient) { return (value * coefficient) >> 8; }
+
+void webp_yuv_to_rgb(int y, int u, int v, std::uint8_t* rgb) {
+    const int luma = webp_mult_hi(y, 19077);
+    rgb[0] = static_cast<std::uint8_t>(webp_clip8(luma + webp_mult_hi(v, 26149) - 14234));
+    rgb[1] = static_cast<std::uint8_t>(
+        webp_clip8(luma - webp_mult_hi(u, 6419) - webp_mult_hi(v, 13320) + 8708));
+    rgb[2] = static_cast<std::uint8_t>(webp_clip8(luma + webp_mult_hi(u, 33050) - 17685));
+}
+
+// One output row. near_* is the chroma row nearer this luma row (weight 3/4 vertically), far_* the other one (the
+// same row at the top and bottom edges).
+void webp_upsample_row(const std::uint8_t* y, const std::uint8_t* near_u, const std::uint8_t* near_v,
+                       const std::uint8_t* far_u, const std::uint8_t* far_v, int width, std::uint8_t* rgb) {
+    webp_yuv_to_rgb(y[0], (3 * near_u[0] + far_u[0] + 2) >> 2, (3 * near_v[0] + far_v[0] + 2) >> 2, rgb);
+    const int pairs = (width - 1) >> 1;
+    for (int x = 1; x <= pairs; ++x) {
+        const int au = near_u[x - 1], bu = near_u[x], cu = far_u[x - 1], du = far_u[x];
+        const int av = near_v[x - 1], bv = near_v[x], cv = far_v[x - 1], dv = far_v[x];
+        const int sum_u = au + bu + cu + du + 8;
+        const int sum_v = av + bv + cv + dv + 8;
+        webp_yuv_to_rgb(y[2 * x - 1], (((sum_u + 2 * (bu + cu)) >> 3) + au) >> 1,
+                        (((sum_v + 2 * (bv + cv)) >> 3) + av) >> 1, rgb + 3 * (2 * x - 1));
+        webp_yuv_to_rgb(y[2 * x], (((sum_u + 2 * (au + du)) >> 3) + bu) >> 1,
+                        (((sum_v + 2 * (av + dv)) >> 3) + bv) >> 1, rgb + 3 * (2 * x));
+    }
+    if ((width & 1) == 0) {
+        const int last = pairs;
+        webp_yuv_to_rgb(y[width - 1], (3 * near_u[last] + far_u[last] + 2) >> 2,
+                        (3 * near_v[last] + far_v[last] + 2) >> 2, rgb + 3 * (width - 1));
+    }
+}
+
+void webp_rgb(const AVFrame* frame, std::uint8_t* rgb) {
+    const int width         = frame->width;
+    const int height        = frame->height;
+    const int chroma_rows   = (height + 1) / 2;
+    const auto plane_row    = [&](int plane, int row) {
+        return frame->data[plane] + static_cast<std::ptrdiff_t>(row) * frame->linesize[plane];
+    };
+    for (int row = 0; row < height; ++row) {
+        const int near = row / 2;
+        const int far  = (row & 1) != 0 ? std::min(near + 1, chroma_rows - 1) : std::max(near - 1, 0);
+        webp_upsample_row(plane_row(0, row), plane_row(1, near), plane_row(2, near), plane_row(1, far),
+                          plane_row(2, far), width, rgb + static_cast<std::size_t>(row) * width * 3);
+    }
 }
 
 struct BufferCursor {
@@ -247,10 +364,22 @@ public:
             stream_              = format_->streams[stream_index_];
             const AVCodec* codec = avcodec_find_decoder(stream_->codecpar->codec_id);
             if (codec == nullptr) { throw_invalid_media("media codec is not supported"); }
+            // The pixel budget before the decoder allocates a frame: the declared size here, and the decoder's own
+            // limit for a frame larger than declared (a 16383 x 16383 WebP would otherwise be allocated first).
+            if (const AVCodecParameters* parameters = stream_->codecpar;
+                parameters->width > 0 && parameters->height > 0 &&
+                static_cast<std::uint64_t>(parameters->width) * static_cast<std::uint64_t>(parameters->height) >
+                    max_decoded_pixels_) {
+                throw Error(ErrorKind::BudgetExceeded, "decoded media pixels exceed processor limit");
+            }
             codec_ = avcodec_alloc_context3(codec);
             if (codec_ == nullptr) { throw std::bad_alloc(); }
-            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0 ||
-                (rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
+            if ((rc = avcodec_parameters_to_context(codec_, stream_->codecpar)) < 0) {
+                throw_invalid_media("failed to open media codec: " + av_error(rc));
+            }
+            codec_->max_pixels = static_cast<std::int64_t>(std::min<std::uint64_t>(
+                max_decoded_pixels_, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())));
+            if ((rc = avcodec_open2(codec_, codec, nullptr)) < 0) {
                 throw_invalid_media("failed to open media codec: " + av_error(rc));
             }
             packet_ = av_packet_alloc();
@@ -324,7 +453,9 @@ public:
         (void)receive();
     }
 
-    Image rgb(const AVFrame* frame, int orientation, bool composite_alpha = false) {
+    // composite_alpha (video): alpha over white. keep_alpha (an image for a processor that composites it): the colour
+    // samples as stored and the alpha plane beside them.
+    Image rgb(const AVFrame* frame, int orientation, bool composite_alpha = false, bool keep_alpha = false) {
         const int width  = frame->width;
         const int height = frame->height;
         if (width <= 0 || height <= 0) {
@@ -338,9 +469,41 @@ public:
         out.height = height;
         const AVPixFmtDescriptor* descriptor =
             av_pix_fmt_desc_get(static_cast<AVPixelFormat>(frame->format));
-        const bool alpha = composite_alpha && descriptor != nullptr &&
-                           (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
-        const AVPixelFormat destination_format = alpha ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
+        const bool has_alpha = descriptor != nullptr && (descriptor->flags & AV_PIX_FMT_FLAG_ALPHA) != 0;
+        const bool alpha     = composite_alpha && has_alpha;
+        const bool keep      = keep_alpha && has_alpha && !composite_alpha;
+        const std::size_t pixels = static_cast<std::size_t>(width) * height;
+        const bool lossy_webp =
+            webp_codec(codec_->codec_id) &&
+            (frame->format == AV_PIX_FMT_YUV420P || frame->format == AV_PIX_FMT_YUVA420P);
+        if (lossy_webp) {
+            out.rgb.resize(pixels * 3);
+            webp_rgb(frame, out.rgb.data());
+            if (keep && frame->format == AV_PIX_FMT_YUVA420P) {
+                out.alpha.resize(pixels);
+                for (int y = 0; y < height; ++y) {
+                    std::memcpy(out.alpha.data() + static_cast<std::size_t>(y) * width,
+                                frame->data[3] + static_cast<std::ptrdiff_t>(y) * frame->linesize[3],
+                                static_cast<std::size_t>(width));
+                }
+            }
+            if (alpha) {
+                for (int y = 0; y < height; ++y) {
+                    const std::uint8_t* a_row =
+                        frame->data[3] + static_cast<std::ptrdiff_t>(y) * frame->linesize[3];
+                    std::uint8_t* row = out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                    for (int x = 0; x < width; ++x) {
+                        const int a = a_row[x];
+                        for (int c = 0; c < 3; ++c) {
+                            row[3 * x + c] =
+                                static_cast<std::uint8_t>(((255 - a) * 255 + a * row[3 * x + c] + 127) / 255);
+                        }
+                    }
+                }
+            }
+            return apply_orientation(std::move(out), orientation);
+        }
+        const AVPixelFormat destination_format = alpha || keep ? AV_PIX_FMT_RGBA : AV_PIX_FMT_RGB24;
         AvImageBuffer converted(width, height, destination_format);
         // Subsampled chroma is interpolated to every pixel and rounded accurately, as libjpeg's
         // fancy upsampling does for JPEG images, instead of repeating the nearest chroma sample.
@@ -352,9 +515,22 @@ public:
         const int rows = sws_scale(sws_, frame->data, frame->linesize, 0, height, converted.data(),
                                    converted.linesize());
         if (rows != height) { throw std::runtime_error("failed to convert media frame to RGB"); }
-        const std::size_t pixels = static_cast<std::size_t>(width) * height;
         out.rgb.resize(pixels * 3);
-        if (!alpha) {
+        if (keep) {
+            out.alpha.resize(pixels);
+            for (int y = 0; y < height; ++y) {
+                const std::uint8_t* source =
+                    converted.data()[0] + static_cast<std::size_t>(y) * converted.linesize()[0];
+                std::uint8_t* destination = out.rgb.data() + static_cast<std::size_t>(y) * width * 3;
+                std::uint8_t* a           = out.alpha.data() + static_cast<std::size_t>(y) * width;
+                for (int x = 0; x < width; ++x) {
+                    destination[3 * x]     = source[4 * x];
+                    destination[3 * x + 1] = source[4 * x + 1];
+                    destination[3 * x + 2] = source[4 * x + 2];
+                    a[x]                   = source[4 * x + 3];
+                }
+            }
+        } else if (!alpha) {
             const std::size_t row_bytes = static_cast<std::size_t>(width) * 3;
             for (int y = 0; y < height; ++y) {
                 std::memcpy(out.rgb.data() + static_cast<std::size_t>(y) * row_bytes,
@@ -477,7 +653,9 @@ std::vector<int> sample_indices(int total, double source_fps, double target_fps,
         max_frames < min_frames) {
         throw std::invalid_argument("invalid video sampling configuration");
     }
-    int count = static_cast<int>(static_cast<double>(total) / source_fps * target_fps);
+    // Clamped before the cast (a tiny source rate makes the quotient exceed int).
+    const double wanted = static_cast<double>(total) / source_fps * target_fps;
+    int count = wanted < static_cast<double>(max_frames) ? static_cast<int>(wanted) : max_frames;
     count     = std::min({std::max(count, min_frames), max_frames, total});
     std::vector<int> indices(static_cast<std::size_t>(count));
     if (count == 1) {
@@ -510,11 +688,15 @@ VideoPlan make_video_plan(std::span<const std::uint8_t> bytes, const Policy& pol
                             ? static_cast<int>(probe.stream()->nb_frames)
                             : 0;
     plan.duration     = probe.duration_seconds();
-    if (plan.total_frames == 0 && plan.duration > 0.0) {
-        plan.total_frames = static_cast<int>(std::nearbyint(plan.duration * plan.fps));
-    }
+    // The duration limit first, and a frame estimate the int holds: a container's huge duration or frame rate made
+    // the cast undefined. An estimate past int's range is past every frame limit too.
     if (plan.duration > policy.max_video_duration_seconds) {
         throw Error(ErrorKind::BudgetExceeded, "video duration exceeds processor limit");
+    }
+    if (plan.total_frames == 0 && plan.duration > 0.0) {
+        const double frames = std::nearbyint(plan.duration * plan.fps);
+        plan.total_frames   = frames < static_cast<double>(std::numeric_limits<int>::max()) ? static_cast<int>(frames)
+                                                                                           : std::numeric_limits<int>::max();
     }
     if (plan.total_frames == 0) { plan.total_frames = count_frames(bytes, policy); }
     if (plan.total_frames == 0) { throw_invalid_media("video contains no decoded frame"); }
@@ -659,9 +841,21 @@ void forward_library_log(void* context, int level, const char* format, std::va_l
 
 } // namespace
 
+bool animated_webp_supported() noexcept {
+    const AVCodecID id = webp_anim_id();
+    return id != AV_CODEC_ID_NONE && avcodec_find_decoder(id) != nullptr;
+}
+
 ImageInfo inspect_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    if (is_raw_rgb(bytes)) { return raw_rgb_info(bytes, policy.max_decoded_pixels); }
+    refuse_unsupported_animated_webp(bytes);
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
+    if (is_png(bytes)) {
+        return png_image_info(bytes, policy.max_decoded_pixels);
+    }
+#endif
     if (is_jpeg(bytes)) {
         ImageInfo result = inspect_jpeg(bytes, policy);
         if (exif_orientation(bytes) >= 5) { std::swap(result.width, result.height); }
@@ -705,6 +899,22 @@ VideoInfo inspect_video(std::span<const std::uint8_t> bytes, const Policy& polic
 Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     validate_input(bytes, policy);
     if (policy.checkpoint) { policy.checkpoint(); }
+    if (is_raw_rgb(bytes)) {
+        const ImageInfo info = raw_rgb_info(bytes, policy.max_decoded_pixels);
+        return Image{.width = info.width,
+                     .height = info.height,
+                     .rgb    = std::vector<std::uint8_t>(bytes.begin() + kRawRgbHeaderBytes, bytes.end())};
+    }
+    refuse_unsupported_animated_webp(bytes);
+    // Some FFmpeg builds (the Windows vcpkg tree) ship without the png decoder; the
+    // native path decodes png directly so those builds accept png images too.
+#ifdef INFERNIX_MEDIA_NATIVE_PNG
+    if (is_png(bytes)) {
+        return decode_png(bytes, policy.max_decoded_pixels, policy.keep_alpha);
+    }
+#endif
+    // JPEG through libjpeg with Pillow's settings, so the pixels equal the reference processors';
+    // other formats through FFmpeg.
     if (is_jpeg(bytes)) {
         return apply_orientation(decode_jpeg(bytes, policy), exif_orientation(bytes));
     }
@@ -714,7 +924,7 @@ Image decode_image(std::span<const std::uint8_t> bytes, const Policy& policy) {
     decoder.frames([&](int index, const AVFrame* frame) {
         if (policy.checkpoint) { policy.checkpoint(); }
         if (index == 0) {
-            result = decoder.rgb(frame, orientation);
+            result = decoder.rgb(frame, orientation, false, policy.keep_alpha);
             return false;
         }
         return true;
@@ -742,6 +952,21 @@ Video decode_video(std::span<const std::uint8_t> bytes, const Policy& policy, do
     out.height  = scan.first_frame.height;
     out.indices = std::move(plan.indices);
     return out;
+}
+
+std::vector<std::uint8_t> encode_raw_rgb(int width, int height, std::span<const std::uint8_t> rgb) {
+    if (width <= 0 || height <= 0 ||
+        rgb.size() != static_cast<std::size_t>(width) * static_cast<std::size_t>(height) * 3U) {
+        throw std::invalid_argument("raw RGB pixels do not match their dimensions");
+    }
+    std::vector<std::uint8_t> bytes(kRawRgbHeaderBytes + rgb.size());
+    std::copy(kRawRgbMagic.begin(), kRawRgbMagic.end(), bytes.begin());
+    for (int i = 0; i < 4; ++i) {
+        bytes[8 + i]  = static_cast<std::uint8_t>(static_cast<std::uint32_t>(width) >> (8 * i));
+        bytes[12 + i] = static_cast<std::uint8_t>(static_cast<std::uint32_t>(height) >> (8 * i));
+    }
+    std::copy(rgb.begin(), rgb.end(), bytes.begin() + kRawRgbHeaderBytes);
+    return bytes;
 }
 
 LibraryLogHandler set_library_log_handler(LibraryLogHandler handler) {

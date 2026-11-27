@@ -93,6 +93,7 @@ constexpr Registration kSwitches[] = {
     {"INFERNIX_TMP_DFLASH_SAMPLED", Scope::Qwen4Exp, Kind::Flag},
     // Flash-Next univer-trees: when set, suppresses root-fork tree verification for A/B attribution.
     {"INFERNIX_TMP_NO_UNIVER_TREES", Scope::Qwen4Exp, Kind::Flag},
+    {"INFERNIX_TMP_GRAPH_EDGES", Scope::Every, Kind::Value},
 };
 constexpr std::size_t kCount = std::size(kSwitches);
 
@@ -239,6 +240,19 @@ double number(std::string_view name, double fallback, double lo, double hi) {
         malformed(name, *v, ("a number in [" + std::to_string(lo) + ", " + std::to_string(hi) + "]").c_str());
     }
     return out;
+}
+
+double continuing_prompt() {
+    static const double fraction = []() {
+        const auto v = value("INFERNIX_TMP_CONTINUING_PROMPT");
+        if (!v) { return 0.0; }
+        double f = 0.0;
+        if (!parse_double(*v, f) || !(f > 0.0 && f <= 1.0)) {
+            malformed("INFERNIX_TMP_CONTINUING_PROMPT", *v, "a fraction in (0, 1]");
+        }
+        return f;
+    }();
+    return fraction;
 }
 
 GwShape gw_shape() {
