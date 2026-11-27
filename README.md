@@ -66,10 +66,10 @@ Or launch `build-native/apps/infernix-serve` directly with the default `FastQ-RH
 
 ```bash
 INFERNIX_EXPERTS_ON_GPU=1 \
+INFERNIX_DRAFT_EXPERT_PRUNE=0.10 \
 ./build-native/apps/infernix-serve \
   /opt/etc/models/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16/Qwen3.8-Flash-Next-NVIDIA-FP4-Local-Infernix-FastQ-RHT16.infernix \
   --expert-a4-activations \
-  --expert-tail-skip 8 \
   --vision \
   --spec mtp --draft-tokens auto \
   --ngram-draft-tokens 31 \
@@ -144,15 +144,15 @@ Measured via `tool-eval-bench bench --perf-only` (`llama-benchy 0.4.0`, `pp=[204
 
 | Test | c | pp t/s | tg t/s | TTFT (ms) | Total (ms) |
 |---|---:|---:|---:|---:|---:|
-| pp2048 tg128 @ d0 | c1 | 3,516* | 88.1 | 583 | 2,025 |
-| pp2048 tg128 @ d0 | c2 | 3,215 | 108.1 | 1,170 | 3,496 |
-| pp2048 tg128 @ d0 | c4 | 3,243 | 182.2 | 2,319 | 5,009 |
-| pp2048 tg128 @ d4096 | c1 | 4,297* | 81.0 | 1,430 | 2,997 |
-| pp2048 tg128 @ d4096 | c2 | 3,853 | 107.2 | 2,873 | 5,218 |
-| pp2048 tg128 @ d4096 | c4 | 3,826 | 173.6 | 5,810 | 8,541 |
-| pp2048 tg128 @ d8192 | c1 | 4,495* | 83.8 | 2,278 | 3,793 |
-| pp2048 tg128 @ d8192 | c2 | 4,027 | 112.3 | 4,582 | 6,820 |
-| pp2048 tg128 @ d8192 | c4 | 4,028 | 182.8 | 9,187 | 11,845 |
+| pp2048 tg128 @ d0 | c1 | 3,263* | 105.5 | 628 | 1,832 |
+| pp2048 tg128 @ d0 | c2 | 3,106 | 125.5 | 1,200 | 3,182 |
+| pp2048 tg128 @ d0 | c4 | 3,171 | 183.1 | 2,373 | 5,029 |
+| pp2048 tg128 @ d4096 | c1 | 4,132* | 94.2 | 1,487 | 2,835 |
+| pp2048 tg128 @ d4096 | c2 | 3,814 | 126.1 | 2,944 | 4,874 |
+| pp2048 tg128 @ d4096 | c4 | 3,817 | 178.8 | 5,771 | 8,479 |
+| pp2048 tg128 @ d8192 | c1 | 4,434* | 91.4 | 2,309 | 3,698 |
+| pp2048 tg128 @ d8192 | c2 | 4,021 | 126.6 | 4,614 | 6,605 |
+| pp2048 tg128 @ d8192 | c4 | 4,030 | 172.2 | 9,217 | 12,046 |
 
 \* `c = 1` prefill column is an estimator output, not wall-clock throughput — only `TTFT`-derived rates are meaningful at `c = 1`.
 
@@ -178,20 +178,19 @@ Measured via [`tools/niah_gate/niah_gate.py`](tools/niah_gate/niah_gate.py) (`--
 | **Run 1** (`93.4%` cached tail `11.4K`) | **PASS (`2048/2048`, `dup=0`, `wrong=0`, `stop`)** | `3.25k tok/s` | `128.3 tok/s` | `97.3%` (`53,666/55,155` MTP+ngram) | `8m 5.8s` |
 | **Run 2** (`100.0%` cached hybrid snapshot) | **PASS (`2048/2048`, `dup=0`, `wrong=0`, `stop`)** | — | **`281.8 tok/s`** | `99.6%` (`59,043/59,306`, `52,145` ngram) | `3m 39.6s` |
 
-### Resident Decode Expert Tail-Skip (`--expert-tail-skip 8`)
+### Batch-Shared Draft Expert Pruning (`INFERNIX_DRAFT_EXPERT_PRUNE=0.10`)
 
-`tools/run_server.sh` defaults to `EXPERT_TAIL_SKIP=8` (`--expert-tail-skip 8`; set `EXPERT_TAIL_SKIP=0` for exact top-10 decode). This enables approximate tail-expert skipping on GB10's all-resident unstaged OMMA verify path:
+`tools/run_server.sh` defaults to `INFERNIX_DRAFT_EXPERT_PRUNE=0.10` with `EXPERT_TAIL_SKIP=0` (set `INFERNIX_DRAFT_EXPERT_PRUNE=0.0` for exact top-10 draft verification). On GB10's `244.4 GB/s` bus, verifying speculative draft tokens activates `~25–35` unique MoE experts instead of `10`, making verification DRAM-bandwidth-bound.
 
-- **Decode-only (prefill stays full top-10):** Experts are skipped **only during decode/verification (`T >= 2`)**; during prefill all `10` routed experts are still executed with no tail skipping.
-- **Batch-aware expert reuse:** Tail skipping is decided across the entire active verification batch rather than per individual token. If Request A routes an expert at tail rank `8` (or `9`), while Request B in the same batch routes that same expert at rank `2`, that expert's weights are already being loaded for Request B — so Request A receives it for free instead of skipping it. An expert is skipped (and its output zeroed) only when **every** token in the batch routes it at rank `>= 8`.
-- **Speed vs. quality trade-off:** Dropping rank `8`–`9` tail experts trades a small amount of model quality relative to exact top-10 (`0`) for higher memory-bandwidth efficiency at low/medium concurrency. More aggressive pruning (`--expert-tail-skip 7`) failed the 210K NIAH quick probe (`before_jag` premature EOS after 3 tokens), whereas `--expert-tail-skip 8` passed both the quick probe and the full 262K NIAH Gate.
+- **Why it is almost lossless:** Prefill, plain decode (`width == 1`), and **every active lane's base token (`t % width == 0`)** stay 100% exact top-10. Pruning only considers routed experts that are **not** used by any lane's base token and whose batch-summed routing weight across all draft columns satisfies $\sum_{t} g_{t,e} < \tau$ (`0.10`). High-weight experts and experts shared across multiple draft tokens are always kept intact.
+- **Why it is better than static `--expert-tail-skip 8`:** Static `--expert-tail-skip 8` drops rank `8`–`9` experts on base tokens as well (degrading base-token quality and regressing `c4` throughput by `-4.1%`). Batch-shared draft pruning leaves every base token untouched, uses actual routing probability mass rather than a hard rank cutoff, exploits cross-token expert overlap in the verify batch, and improves `c1`/`c2` (`+14%` to `+17%` over exact `0.0`) without regressing `c4`.
+- **262K NIAH Gate sweet spot:** `tau = 0.10` passes the full 262K NIAH Gate (`2048/2048`, `0` duplicates, `0` wrong, `61,799` output / `35,224` reasoning tokens — matching exact `0.0`'s `61,786` / `35,211`), whereas `tau = 0.12` (`765/2048`) and `tau = 0.15` (`481/2048`) stop early on `incomplete_recall`.
 
-| Benchmark (`FastQ-RHT16`, `T=1.0`, `int8` KV) | Exact Default (`0`) | `--expert-tail-skip 8` | Delta |
-|---|---:|---:|---:|
-| `llama-benchy` `c1` (`d0 / d4096 / d8192`) | `85.1 / 84.6 / 82.4` (avg `84.0`) | **`95.0 / 89.3 / 86.7`** (avg **`90.3`**) | **`+7.5%`** |
-| `llama-benchy` `c2` (`d0 / d4096 / d8192`) | `109.5 / 113.4 / 106.3` (avg `109.7`) | **`118.4 / 114.6 / 118.9`** (avg **`117.3`**) | **`+6.9%`** |
-| `llama-benchy` `c4` (`d0 / d4096 / d8192`) | **`179.3 / 174.9 / 176.4`** (avg **`176.9`**) | `169.4 / 166.6 / 173.0` (avg `169.7`) | `-4.1%` |
-| `262K` NIAH Gate (`seed=1234`, `2048` needles) | **PASS (`2048/2048`)** @ `129.3 tok/s` (`97.3%`) | **PASS (`2048/2048`)** @ **`140.5 tok/s`** (`97.7%`) | **`+8.7%`** |
+| `INFERNIX_DRAFT_EXPERT_PRUNE` (`EXPERT_TAIL_SKIP=0`, `int8` KV) | `llama-benchy` `c1` (`d0 / d4096 / d8192`) | `llama-benchy` `c2` (`d0 / d4096 / d8192`) | `llama-benchy` `c4` (`d0 / d4096 / d8192`) | `262K` NIAH Gate (`seed=1234`, `2048` needles) |
+|---:|---|---|---|---|
+| `0.0` (exact baseline) | `88.1 / 81.0 / 83.8` (avg `84.3`) | `108.1 / 107.2 / 112.3` (avg `109.2`) | `182.2 / 173.6 / 182.8` (avg `179.5`) | **PASS (`2048/2048`)** (`61,786` out / `35,211` reas) |
+| **`0.10` (default)** | **`105.5 / 94.2 / 91.4`** (avg **`97.0`**, **`+15.1%`**) | **`125.5 / 126.1 / 126.6`** (avg **`126.1`**, **`+15.5%`**) | **`183.1 / 178.8 / 172.2`** (avg `178.0`) | **PASS (`2048/2048`)** (`61,799` out / `35,224` reas) |
+| `0.12` | `101.7 / 105.9 / 91.3` (avg `99.6`) | `127.4 / 135.5 / 124.4` (avg `129.1`) | `171.8 / 172.9 / 170.0` (avg `171.6`) | FAIL (`765/2048`, `incomplete_recall`) |
 
 ### `tool-eval-bench` Results (`HC4-W4Dense`, `tool-eval-bench v3.0.1.dev10+g1cd7309e5`)
 

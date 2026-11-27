@@ -43,7 +43,8 @@
 #   NGRAM_MIN_MATCH (default: 8), INFERNIX_NGRAM_WIDTH_COST (optional override)
 #   THINKING_FLAG (default: empty), REASONING_EFFORT (default: medium)
 #   EXPERT_A4_ACTIVATIONS (default: 1 for FP4-Local)
-#   EXPERT_TAIL_SKIP (default: 8; set 0 for exact top-10 without tail skip)
+#   EXPERT_TAIL_SKIP (default: 0; set 8 for legacy rank-based tail skip)
+#   INFERNIX_DRAFT_EXPERT_PRUNE (default: 0.10; set 0.0 for exact top-10 draft verify)
 #   SKIP_BUILD=1 to skip rebuilding infernix-serve
 #
 
@@ -75,7 +76,8 @@ MAX_CONCURRENCY="${MAX_CONCURRENCY:-8}"
 EXPLICIT_MODEL_ID=""
 MODEL_ALIAS="${MODEL_ALIAS:-}"
 EXPERT_A4_DEFAULT=0
-EXPERT_TAIL_SKIP="${EXPERT_TAIL_SKIP:-8}"
+EXPERT_TAIL_SKIP="${EXPERT_TAIL_SKIP:-0}"
+INFERNIX_DRAFT_EXPERT_PRUNE="${INFERNIX_DRAFT_EXPERT_PRUNE:-0.10}"
 VISION_DEFAULT=1
 
 # Parse options
@@ -265,10 +267,12 @@ echo " Max Context     : ${MAX_CONTEXT} tokens"
 echo " Max Concurrency : ${MAX_CONCURRENCY}"
 echo " Speculative     : ${SPEC_BACKEND} (auto) + N-gram (${NGRAM_DRAFT_TOKENS} drafts, min-match ${NGRAM_MIN_MATCH})"
 echo " Expert Tail-Skip: ${EXPERT_TAIL_SKIP}"
+echo " Draft Prune Tau : ${INFERNIX_DRAFT_EXPERT_PRUNE}"
 echo "========================================================================================"
 echo
 
 export INFERNIX_EXPERTS_ON_GPU=1
+export INFERNIX_DRAFT_EXPERT_PRUNE
 if [[ -n "${INFERNIX_NGRAM_WIDTH_COST:-}" ]]; then
     export INFERNIX_NGRAM_WIDTH_COST
 fi
